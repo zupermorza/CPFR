@@ -1,0 +1,1192 @@
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from typing import List, Tuple, Dict, Optional
+from functools import lru_cache
+import warnings
+warnings.filterwarnings('ignore')
+
+APP_TITLE = "CPFR Store–Item Analysis - OPTIMIZED"
+EXPORT_DIR = "cpfr_outputs"
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+########################
+# Config               #
+########################
+DEFAULT_CONFIG = {
+    "file_current": "",
+    "file_wk5": "",
+    "file_next4": "",
+    "file_store_subcat": "",
+    "file_item_lookup": "",
+    "file_store_lookup": "",
+    "file_valid_item_trait": "",
+    "lead_time_wks": 2,
+    "buffer_wks": 0.5,
+    "hhi_threshold": 0.25,
+    "share_excess_pp": 20.0
+}
+
+def load_config(path: str) -> dict:
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="latin-1") as f:
+                cfg = json.load(f)
+            return {**DEFAULT_CONFIG, **cfg}
+        except Exception:
+            return DEFAULT_CONFIG.copy()
+    return DEFAULT_CONFIG.copy()
+
+def save_config(path: str, cfg: dict) -> None:
+    with open(path, "w", encoding="latin-1") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+########################
+# Utilities            #
+########################
+TRAIT_MAP = {9: "BA", 1312: "MIBO", 969: "BAE", 297: "SC"}
+SMALL_TRAITS = {"BAE","MIBO"}
+HIERARCHY_LEVELS = {
+    "store_trait": "Store Trait",
+    "state": "State", 
+    "level_0": "Level_0",
+    "brand": "Brand",
+    "item_id": "Item Mattel"
+}
+
+def lower_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
+
+def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert to efficient data types to reduce memory usage"""
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            if col in ['store_id', 'client_item_nbr', 'item_id', 'store_trait', 'state', 'brand', 'level_0', 'subcategory']:
+                df[col] = df[col].astype('category')
+        elif df[col].dtype == 'float64':
+            df[col] = pd.to_numeric(df[col], downcast='float')
+        elif df[col].dtype == 'int64':
+            df[col] = pd.to_numeric(df[col], downcast='integer')
+    return df
+
+def normalize_keys(df: pd.DataFrame) -> pd.DataFrame:
+    for key in ["store_id","item_id","client_item_nbr"]:
+        if key in df.columns:
+            df[key] = df[key].astype(str).str.strip()
+    if "store_id" in df.columns:
+        df["store_id"] = df["store_id"].str.replace(r"\.0$", "", regex=True)
+    if "store_trait" in df.columns:
+        st = pd.to_numeric(df["store_trait"], errors="coerce")
+        mapped = st.map(TRAIT_MAP)
+        df["store_trait"] = mapped.fillna(df["store_trait"].astype(str).str.strip())
+    return df
+
+def clip_nonneg(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0)
+    return df
+
+def dedup_sum(df: pd.DataFrame, keys: List[str], sum_cols: List[str], max_cols: List[str] = None) -> pd.DataFrame:
+    agg_dict = {c: "sum" for c in sum_cols if c in df.columns}
+    if max_cols:
+        for c in max_cols:
+            if c in df.columns:
+                agg_dict[c] = "max"
+    return df.groupby(keys, dropna=False, as_index=False, observed=True).agg(agg_dict)
+
+def safe_merge(left: pd.DataFrame, right: pd.DataFrame, on: List[str], how: str = "left") -> pd.DataFrame:
+    right_dedup = right.drop_duplicates(on)
+    return pd.merge(left, right_dedup, on=on, how=how)
+
+def format_percentages(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert decimal percentages to percentage format with 1 decimal"""
+    percent_cols = [col for col in df.columns if any(x in col.lower() for x in ['pct', 'percent', 'rate', 'ratio', 'instock'])]
+    for col in percent_cols:
+        if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = (df[col] * 100).round(1)
+    return df
+
+def round_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """Round all numeric columns to 1 decimal place"""
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        df[col] = df[col].round(1)
+    return df
+
+def apply_hierarchy_filters(df: pd.DataFrame, filters: Dict) -> pd.DataFrame:
+    """Apply hierarchy filters to dataframe"""
+    if df.empty:
+        return df
+    
+    for filter_col, filter_values in filters.items():
+        if filter_col in df.columns and filter_values:
+            df = df[df[filter_col].isin(filter_values)]
+    
+    return df
+
+########################
+# Cached Readers       #
+########################
+@lru_cache(maxsize=1)
+def read_current_cached(file: str) -> pd.DataFrame:
+    print(f"  Loading current inventory...")
+    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
+    rename_map = {}
+    if "item nbr" in df.columns: rename_map["item nbr"] = "client_item_nbr"
+    if "store nbr" in df.columns: rename_map["store nbr"] = "store_id"
+    if "pos qty" in df.columns: rename_map["pos qty"] = "sales_last4"
+    if "total inv" in df.columns: rename_map["total inv"] = "on_hand"
+    if "sel store trait" in df.columns: rename_map["sel store trait"] = "store_trait"
+    df = df.rename(columns=rename_map)
+    drop_cols = [c for c in df.columns if c.strip().lower() == "item flags"]
+    if drop_cols: df = df.drop(columns=drop_cols)
+    df = clip_nonneg(df, ["on_hand","sales_last4"])
+    df = normalize_keys(df)
+    df = dedup_sum(df, keys=["store_id","client_item_nbr"], sum_cols=["on_hand","sales_last4"])
+    df = optimize_dtypes(df)
+    return df
+
+@lru_cache(maxsize=1)
+def read_wk5_cached(file: str) -> pd.DataFrame:
+    print(f"  Loading week -5 inventory...")
+    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
+    rename_map = {}
+    if "item nbr" in df.columns: rename_map["item nbr"] = "client_item_nbr"
+    if "store nbr" in df.columns: rename_map["store nbr"] = "store_id"
+    if "hist on hand qty" in df.columns: rename_map["hist on hand qty"] = "on_hand_wk_-5"
+    df = df.rename(columns=rename_map)
+    df = clip_nonneg(df, ["on_hand_wk_-5"])
+    df = normalize_keys(df)
+    df = dedup_sum(df, keys=["store_id","client_item_nbr"], sum_cols=["on_hand_wk_-5"])
+    df = optimize_dtypes(df)
+    return df
+
+@lru_cache(maxsize=1)
+def read_next4_cached(file: str) -> pd.DataFrame:
+    print(f"  Loading forecast N4W...")
+    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
+    rename_map = {}
+    if "item nbr" in df.columns: rename_map["item nbr"] = "client_item_nbr"
+    if "store nbr" in df.columns: rename_map["store nbr"] = "store_id"
+    if "pos qty" in df.columns: rename_map["pos qty"] = "n4w"
+    df = df.rename(columns=rename_map)
+    df = clip_nonneg(df, ["n4w"])
+    df = normalize_keys(df)
+    df = dedup_sum(df, keys=["store_id","client_item_nbr"], sum_cols=["n4w"])
+    df = optimize_dtypes(df)
+    return df
+
+@lru_cache(maxsize=1)
+def read_item_lookup_cached(file: str) -> pd.DataFrame:
+    print(f"  Loading item lookup...")
+    try:
+        try:
+            df = pd.read_csv(file, encoding="utf-8-sig")
+        except Exception:
+            df = pd.read_csv(file, encoding="latin-1")
+        df = lower_cols(df)
+        rename_map = {}
+        for col in df.columns:
+            if col.strip().lower() in ["item nbr","item_nbr","item  nbr"]:
+                rename_map[col] = "client_item_nbr"
+                break
+        if "item mattel" in df.columns: rename_map["item mattel"] = "item_id"
+        if "subcategoria" in df.columns: rename_map["subcategoria"] = "subcategory"
+        if "sub-category" in df.columns: rename_map["sub-category"] = "subcategory"
+        if "level_0" in df.columns: rename_map["level_0"] = "level_0"
+        for col in df.columns:
+            lc = col.lower()
+            if ("año" in lc) or ("aÃ±o" in lc) or ("aÃ£Â±o" in lc) or (lc == "ano"):
+                rename_map[col] = "year"
+                break
+        df = df.rename(columns=rename_map)
+        if "brand" not in df.columns:
+            df["brand"] = "Unknown"
+        keep = [c for c in ["item_id","client_item_nbr","brand","subcategory","year","level_0"] if c in df.columns]
+        df = df[keep].drop_duplicates("item_id")
+        df = normalize_keys(df)
+        df = optimize_dtypes(df)
+        return df
+    except Exception as e:
+        print(f"Error reading Item Lookup: {e}")
+        return pd.DataFrame(columns=["item_id","client_item_nbr","brand","level_0"])
+
+@lru_cache(maxsize=1)
+def read_store_lookup_cached(file: str) -> pd.DataFrame:
+    print(f"  Loading store lookup...")
+    df = lower_cols(pd.read_csv(file, encoding="latin-1"))
+    rename_map = {}
+    if "store number" in df.columns: rename_map["store number"] = "store_id"
+    if "store name" in df.columns: rename_map["store name"] = "store_name"
+    if "estado" in df.columns: rename_map["estado"] = "state"
+    if "región" in df.columns: rename_map["región"] = "region"
+    if "regiÃ³n" in df.columns: rename_map["regiÃ³n"] = "region"
+    if "mini formato" in df.columns: rename_map["mini formato"] = "store_trait"
+    if "sel store trait" in df.columns: rename_map["sel store trait"] = "store_trait"
+    df = df.rename(columns=rename_map)
+    df = normalize_keys(df)
+    if "store_id" in df.columns:
+        df = df.drop_duplicates("store_id", keep="first")
+    df = optimize_dtypes(df)
+    return df
+
+@lru_cache(maxsize=1)
+def read_store_subcat_cached(file: str) -> pd.DataFrame:
+    print(f"  Loading store-subcategory data...")
+    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
+    if "store-subcategory id" in df.columns:
+        df[['store_id', 'subcategory']] = df['store-subcategory id'].str.extract(r'^(\d+)(.*)$')
+        df['subcategory'] = df['subcategory'].str.strip()
+        df = df.drop(columns=['store-subcategory id'])
+    rename_map = {}
+    if "pos retail" in df.columns: rename_map["pos retail"] = "units"
+    df = df.rename(columns=rename_map)
+    df = clip_nonneg(df, ["units"])
+    if not {"store_id","subcategory","units"}.issubset(df.columns):
+        raise ValueError("Store–Subcategory file missing required columns (store_id, subcategory, units).")
+    df = normalize_keys(df)
+    sub_last4 = df.groupby(["store_id","subcategory"], dropna=False, observed=True)["units"].sum().reset_index()
+    sub_last4 = optimize_dtypes(sub_last4)
+    return sub_last4
+
+@lru_cache(maxsize=1)
+def read_valid_item_trait_cached(file: str) -> pd.DataFrame:
+    print(f"  Loading valid item-trait combinations...")
+    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
+    rename_map = {}
+    if "item mattel" in df.columns: rename_map["item mattel"] = "item_id"
+    if "item nbr" in df.columns: rename_map["item nbr"] = "client_item_nbr"
+    if "store trait" in df.columns: rename_map["store trait"] = "store_trait"
+    if "mini formato" in df.columns: rename_map["mini formato"] = "store_trait"
+    if "sel store trait" in df.columns: rename_map["sel store trait"] = "store_trait"
+    df = df.rename(columns=rename_map)
+    df = normalize_keys(df)
+    keep = [c for c in ["item_id","store_trait"] if c in df.columns]
+    if not set(["item_id","store_trait"]).issubset(df.columns):
+        raise ValueError("Valid Item–Store Trait file must include Item (Item Mattel) and Store Trait.")
+    df = df[keep].dropna().drop_duplicates()
+    df = optimize_dtypes(df)
+    return df
+
+############################
+# Core Computations        #
+############################
+def compute_instock_by_levels(df_current: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Compute in-stock KPIs separately for each hierarchy level"""
+    results = {}
+    
+    if df_current.empty:
+        return results
+    
+    tmp = df_current.copy()
+    tmp["in_stock_flag"] = (tmp["on_hand"] > 0).astype(np.int8)
+    
+    # Compute for each hierarchy level independently
+    for level_col, level_name in HIERARCHY_LEVELS.items():
+        if level_col in tmp.columns:
+            g = tmp.groupby(level_col, dropna=False, as_index=False, observed=True)
+            out = g.agg(
+                sites=("in_stock_flag", "count"),
+                in_stock_sites=("in_stock_flag", "sum"),
+                on_hand=("on_hand", "sum"),
+                sales_last4=("sales_last4", "sum"),
+            )
+            
+            out["instock_pct_sites"] = np.where(out["sites"]>0, out["in_stock_sites"]/out["sites"], np.nan)
+            out["instock_pct_sales_weighted"] = out["instock_pct_sites"]
+            
+            out = format_percentages(out)
+            out = round_numeric(out)
+            results[level_col] = out
+    
+    return results
+
+def compute_slow_movers_by_levels(df_current: pd.DataFrame, df_wk5: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Compute slow movers separately for each hierarchy level"""
+    results = {}
+    
+    if df_current.empty or df_wk5.empty:
+        return results
+    
+    base = safe_merge(df_current, df_wk5, on=["store_id","client_item_nbr"], how="left")
+    slow = base[(base["on_hand_wk_-5"].fillna(0) > 0) & (base["sales_last4"].fillna(0) == 0)].copy()
+    
+    if slow.empty:
+        return results
+    
+    # Aggregate by each level
+    for level_col, level_name in HIERARCHY_LEVELS.items():
+        if level_col in slow.columns:
+            slow_agg = slow.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
+                'on_hand': 'sum',
+                'sales_last4': 'sum',
+                'on_hand_wk_-5': 'sum'
+            })
+            slow_agg["slow_mover_units"] = slow_agg["on_hand"]
+            slow_agg = round_numeric(slow_agg)
+            results[level_col] = slow_agg
+    
+    return results
+
+def compute_compliance_by_levels(df_current: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Compute min/safety compliance separately for each hierarchy level"""
+    results = {}
+    
+    if df_current.empty:
+        return results
+    
+    df = df_current.copy()
+    df["mean_wk"] = df["sales_last4"].fillna(0) / 4.0
+    df["std_wk"] = np.sqrt(df["mean_wk"].clip(lower=0))
+    df["suggested_safety"] = (df["std_wk"] * 1.65 + df["mean_wk"] * 1.0).clip(lower=0)
+    
+    if "safety_stock" not in df.columns:
+        df["safety_stock"] = df["suggested_safety"]
+    if "min_stock" not in df.columns:
+        df["min_stock"] = df["mean_wk"]
+    
+    df["below_min_flag"] = (df["on_hand"] < df["min_stock"]).astype(np.int8)
+    df["below_safety_flag"] = (df["on_hand"] < df["safety_stock"]).astype(np.int8)
+    
+    # Aggregate by each level
+    for level_col, level_name in HIERARCHY_LEVELS.items():
+        if level_col in df.columns:
+            comp_agg = df.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
+                'on_hand': 'sum',
+                'min_stock': 'sum',
+                'safety_stock': 'sum',
+                'below_min_flag': 'sum',
+                'below_safety_flag': 'sum',
+                'suggested_safety': 'sum'
+            })
+            comp_agg = round_numeric(comp_agg)
+            results[level_col] = comp_agg
+    
+    return results
+
+def compute_forecast(df_current_enriched: pd.DataFrame, df_next4: pd.DataFrame,
+                     df_store_subcat: pd.DataFrame) -> pd.DataFrame:
+    """Compute forecast (store-item level for uplift calculation)"""
+    base = safe_merge(df_current_enriched, df_next4, on=["store_id","client_item_nbr"], how="left")
+    wk_lvl = base["sales_last4"].fillna(0) / 4.0
+    baseline_4w = base["n4w"].fillna(np.nan)
+    blended_4w = np.where(pd.isna(baseline_4w), wk_lvl * 4.0, 0.6 * baseline_4w + 0.4 * (wk_lvl * 4.0))
+    base["fc_final"] = pd.Series(blended_4w).clip(lower=0)
+
+    # Apply uplift
+    if not df_store_subcat.empty and ("subcategory" in base.columns):
+        sub = df_store_subcat.copy()
+        sub_chain = sub.groupby("subcategory", dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_chain")
+        sub_store = sub.groupby(["store_id","subcategory"], dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_store")
+        sub_share = safe_merge(sub_store, sub_chain, on=["subcategory"], how="left")
+        sub_share["store_sub_share"] = np.where(sub_share["sub_units_chain"]>0, sub_share["sub_units_store"]/sub_share["sub_units_chain"], np.nan)
+        sub_share["sum_share_subcat"] = sub_share.groupby("subcategory", observed=True)["store_sub_share"].transform("sum")
+        sub_share["store_sub_share_norm"] = np.where(sub_share["sum_share_subcat"]>0, sub_share["store_sub_share"]/sub_share["sum_share_subcat"], sub_share["store_sub_share"])
+        base = safe_merge(base, sub_share[["store_id","subcategory","store_sub_share_norm"]], on=["store_id","subcategory"], how="left")
+        med = sub_share.groupby("subcategory", observed=True)["store_sub_share_norm"].median().rename("median_sub_share_norm").reset_index()
+        base = safe_merge(base, med, on=["subcategory"], how="left")
+        base["uplift_factor"] = np.where(base["median_sub_share_norm"]>0, base["store_sub_share_norm"]/base["median_sub_share_norm"], 1.0)
+        if "store_trait" in base.columns:
+            base["uplift_factor"] = np.where((base["store_trait"].isin(list(SMALL_TRAITS))) | (base["store_sub_share_norm"].isna()), 1.0, base["uplift_factor"])
+        else:
+            base["uplift_factor"] = np.where((base["store_sub_share_norm"].isna()), 1.0, base["uplift_factor"])
+        base["fc_final"] = (base["fc_final"] * base["uplift_factor"]).fillna(base["fc_final"])
+
+    return base
+
+def compute_forecast_by_levels(df_fc: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Aggregate forecast by each hierarchy level"""
+    results = {}
+    
+    if df_fc.empty:
+        return results
+    
+    for level_col, level_name in HIERARCHY_LEVELS.items():
+        if level_col in df_fc.columns:
+            fc_agg = df_fc.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
+                'on_hand': 'sum',
+                'sales_last4': 'sum',
+                'fc_final': 'sum'
+            })
+            fc_agg = round_numeric(fc_agg)
+            results[level_col] = fc_agg
+    
+    return results
+
+def compute_risk_by_levels(df_fc: pd.DataFrame, lead_time_wks: int = 2, buffer_wks: float = 0.5) -> Dict[str, pd.DataFrame]:
+    """Compute stockout risk separately for each hierarchy level"""
+    results = {}
+    
+    if df_fc.empty:
+        return results
+    
+    df = df_fc.copy()
+    df["wk_demand"] = df["fc_final"] / 4.0
+    demand_horizon = (lead_time_wks + buffer_wks) * df["wk_demand"]
+    df["demand_horizon"] = demand_horizon
+    df["risk_gap"] = df["demand_horizon"] - df["on_hand"]
+    df["stockout_risk_flag"] = (df["risk_gap"] > 0).astype(np.int8)
+    df["risk_score"] = np.where(df["demand_horizon"]>0, df["risk_gap"]/df["demand_horizon"], 0)
+    
+    # Aggregate by each level
+    for level_col, level_name in HIERARCHY_LEVELS.items():
+        if level_col in df.columns:
+            risk_agg = df.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
+                'on_hand': 'sum',
+                'fc_final': 'sum',
+                'wk_demand': 'sum',
+                'demand_horizon': 'sum',
+                'risk_gap': 'sum',
+                'stockout_risk_flag': 'sum',
+                'risk_score': 'mean'
+            })
+            risk_agg = round_numeric(risk_agg)
+            results[level_col] = risk_agg
+    
+    return results
+
+def compute_distribution_by_levels(df_current: pd.DataFrame,
+                               df_store_subcat: pd.DataFrame,
+                               item_lookup: pd.DataFrame,
+                               store_lookup: pd.DataFrame,
+                               hhi_threshold: float = 0.25,
+                               share_excess_pp: float = 20.0) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+    """Compute distribution metrics separately for each hierarchy level"""
+    hhi_results = {}
+    over_results = {}
+    
+    if df_current.empty:
+        return hhi_results, over_results
+    
+    cur = safe_merge(df_current, item_lookup, on=["client_item_nbr"], how="left")
+    cur = safe_merge(cur, store_lookup, on=["store_id"], how="left")
+    
+    # Calculate HHI at item level first
+    item_tot = cur.groupby("client_item_nbr", dropna=False, observed=True)["on_hand"].sum().reset_index(name="item_onhand_total")
+    cur = safe_merge(cur, item_tot, on=["client_item_nbr"], how="left")
+    cur["share_store_of_item"] = np.where(cur["item_onhand_total"]>0, cur["on_hand"]/cur["item_onhand_total"], 0)
+    
+    # HHI by item
+    hhi = cur.groupby("client_item_nbr", dropna=False, observed=True)["share_store_of_item"].apply(lambda s: np.sum(np.square(s))).reset_index(name="hhi")
+    hhi_flags = safe_merge(hhi, item_lookup[["client_item_nbr","item_id","brand","subcategory","year","level_0"]].drop_duplicates("client_item_nbr", keep="first"), on=["client_item_nbr"], how="left")
+    hhi_flags["hhi_flag"] = (hhi_flags["hhi"] >= hhi_threshold).astype(np.int8)
+    
+    # Aggregate HHI by each level
+    for level_col, level_name in HIERARCHY_LEVELS.items():
+        if level_col in hhi_flags.columns:
+            hhi_agg = hhi_flags.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
+                'hhi': 'mean',
+                'hhi_flag': 'sum'
+            })
+            hhi_agg = round_numeric(hhi_agg)
+            hhi_results[level_col] = hhi_agg
+    
+    # Over-concentration
+    if not df_store_subcat.empty and ("subcategory" in item_lookup.columns):
+        sub = df_store_subcat.copy()
+        sub_chain = sub.groupby("subcategory", dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_chain")
+        sub_store = sub.groupby(["store_id","subcategory"], dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_store")
+        sub_share = safe_merge(sub_store, sub_chain, on=["subcategory"], how="left")
+        sub_share["store_sub_share"] = np.where(sub_share["sub_units_chain"]>0, sub_share["sub_units_store"]/sub_share["sub_units_chain"], 0)
+        sub_share["sum_share_subcat"] = sub_share.groupby("subcategory", observed=True)["store_sub_share"].transform("sum")
+        sub_share["store_sub_share_norm"] = np.where(sub_share["sum_share_subcat"]>0, sub_share["store_sub_share"]/sub_share["sum_share_subcat"], sub_share["store_sub_share"])
+
+        cur2 = safe_merge(cur, sub_share[["store_id","subcategory","store_sub_share_norm"]], on=["store_id","subcategory"], how="left")
+        cur2["share_gap_pp"] = 100.0 * (cur2["share_store_of_item"] - cur2["store_sub_share_norm"])
+        cur2["over_concentrated_flag"] = (cur2["share_gap_pp"] >= share_excess_pp).astype(np.int8)
+        
+        # Aggregate by each level
+        for level_col, level_name in HIERARCHY_LEVELS.items():
+            if level_col in cur2.columns:
+                over_agg = cur2[cur2["over_concentrated_flag"]==1].groupby(level_col, dropna=False, as_index=False, observed=True).agg({
+                    'on_hand': 'sum',
+                    'share_gap_pp': 'mean'
+                })
+                over_agg = round_numeric(over_agg)
+                over_results[level_col] = over_agg
+
+    return hhi_results, over_results
+
+def get_filter_options(dataframes: Dict) -> Dict:
+    """Get unique values for filter dropdowns"""
+    filters = {
+        "store_trait": [],
+        "state": [], 
+        "level_0": [],
+        "brand": [],
+        "item_id": []
+    }
+    
+    if "cur_enriched" in dataframes and not dataframes["cur_enriched"].empty:
+        df = dataframes["cur_enriched"]
+        if "store_trait" in df.columns:
+            filters["store_trait"] = sorted(df["store_trait"].dropna().unique().tolist())
+        if "state" in df.columns:
+            filters["state"] = sorted(df["state"].dropna().unique().tolist())
+        if "level_0" in df.columns:
+            filters["level_0"] = sorted(df["level_0"].dropna().unique().tolist())
+        if "brand" in df.columns:
+            filters["brand"] = sorted(df["brand"].dropna().unique().tolist())
+        if "item_id" in df.columns:
+            filters["item_id"] = sorted(df["item_id"].dropna().unique().tolist())
+    
+    return filters
+
+############################
+# Enhanced Chart Generation#
+############################
+def create_enhanced_charts(outputs: Dict) -> List:
+    """Create actionable CPFR charts following hierarchy"""
+    figs = []
+    
+    # Chart 1: In-Stock Performance by Store Trait & Level_0
+    fig1 = plt.figure(figsize=(14, 6))
+    
+    ax1 = plt.subplot(1, 2, 1)
+    if "instock_store_trait" in outputs and not outputs["instock_store_trait"].empty:
+        df = outputs["instock_store_trait"]
+        bars = ax1.bar(df["store_trait"].astype(str), df["instock_pct_sites"], color='steelblue')
+        ax1.set_ylabel("In-Stock % (Sites)", fontsize=11)
+        ax1.set_title("In-Stock Performance by Store Trait", fontsize=12, fontweight='bold')
+        ax1.axhline(y=90, color='red', linestyle='--', linewidth=1, label='Target 90%')
+        ax1.legend()
+        ax1.grid(axis='y', alpha=0.3)
+        for bar in bars:
+            height = bar.get_height()
+            ax1.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.1f}%', ha='center', va='bottom', fontsize=9)
+    
+    ax2 = plt.subplot(1, 2, 2)
+    if "instock_level_0" in outputs and not outputs["instock_level_0"].empty:
+        df = outputs["instock_level_0"].sort_values("instock_pct_sites", ascending=False).head(10)
+        bars = ax2.barh(df["level_0"].astype(str), df["instock_pct_sites"], color='teal')
+        ax2.set_xlabel("In-Stock % (Sites)", fontsize=11)
+        ax2.set_title("Top 10 Categories - In-Stock %", fontsize=12, fontweight='bold')
+        ax2.axvline(x=90, color='red', linestyle='--', linewidth=1, label='Target 90%')
+        ax2.legend()
+        ax2.invert_yaxis()
+        ax2.grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    figs.append(fig1)
+    
+    # Chart 2: Inventory Alerts Dashboard
+    fig2 = plt.figure(figsize=(14, 10))
+    
+    ax1 = plt.subplot(2, 2, 1)
+    if "slow_level_0" in outputs and not outputs["slow_level_0"].empty:
+        df = outputs["slow_level_0"].sort_values("slow_mover_units", ascending=False).head(10)
+        ax1.barh(df["level_0"].astype(str), df["slow_mover_units"], color='darkred')
+        ax1.set_xlabel("Units (Slow Movers)", fontsize=10)
+        ax1.set_title("Top 10 Categories - Slow Moving Inventory", fontsize=11, fontweight='bold')
+        ax1.invert_yaxis()
+        ax1.grid(axis='x', alpha=0.3)
+    
+    ax2 = plt.subplot(2, 2, 2)
+    if "compliance_brand" in outputs and not outputs["compliance_brand"].empty:
+        df = outputs["compliance_brand"].sort_values("below_min_flag", ascending=False).head(10)
+        ax2.barh(df["brand"].astype(str), df["below_min_flag"], color='orange')
+        ax2.set_xlabel("Sites Below Minimum", fontsize=10)
+        ax2.set_title("Top 10 Brands - Below Min Stock", fontsize=11, fontweight='bold')
+        ax2.invert_yaxis()
+        ax2.grid(axis='x', alpha=0.3)
+    
+    ax3 = plt.subplot(2, 2, 3)
+    if "compliance_level_0" in outputs and not outputs["compliance_level_0"].empty:
+        df = outputs["compliance_level_0"].sort_values("below_safety_flag", ascending=False).head(10)
+        ax3.barh(df["level_0"].astype(str), df["below_safety_flag"], color='tomato')
+        ax3.set_xlabel("Sites Below Safety", fontsize=10)
+        ax3.set_title("Top 10 Categories - Below Safety Stock", fontsize=11, fontweight='bold')
+        ax3.invert_yaxis()
+        ax3.grid(axis='x', alpha=0.3)
+    
+    ax4 = plt.subplot(2, 2, 4)
+    if "compliance_state" in outputs and not outputs["compliance_state"].empty:
+        df = outputs["compliance_state"].sort_values("below_safety_flag", ascending=False).head(10)
+        x = np.arange(len(df))
+        width = 0.35
+        ax4.barh(x - width/2, df["below_min_flag"], width, label='Below Min', color='orange')
+        ax4.barh(x + width/2, df["below_safety_flag"], width, label='Below Safety', color='tomato')
+        ax4.set_yticks(x)
+        ax4.set_yticklabels(df["state"].astype(str))
+        ax4.set_xlabel("Number of Alerts", fontsize=10)
+        ax4.set_title("Top 10 States - Inventory Alerts", fontsize=11, fontweight='bold')
+        ax4.legend()
+        ax4.invert_yaxis()
+        ax4.grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    figs.append(fig2)
+    
+    # Chart 3: Stockout Risk Analysis
+    fig3 = plt.figure(figsize=(14, 10))
+    
+    ax1 = plt.subplot(2, 2, 1)
+    if "risk_level_0" in outputs and not outputs["risk_level_0"].empty:
+        df = outputs["risk_level_0"].sort_values("risk_score", ascending=False).head(15)
+        bars = ax1.bar(df["level_0"].astype(str), df["risk_score"], color='crimson')
+        ax1.set_ylabel("Average Risk Score", fontsize=10)
+        ax1.set_title("Stockout Risk by Category (Top 15)", fontsize=11, fontweight='bold')
+        ax1.tick_params(axis='x', rotation=45, labelsize=8)
+        ax1.axhline(y=0.5, color='orange', linestyle='--', linewidth=1, label='High Risk Threshold')
+        ax1.legend()
+        ax1.grid(axis='y', alpha=0.3)
+    
+    ax2 = plt.subplot(2, 2, 2)
+    if "risk_brand" in outputs and not outputs["risk_brand"].empty:
+        df = outputs["risk_brand"].sort_values("stockout_risk_flag", ascending=False).head(10)
+        ax2.barh(df["brand"].astype(str), df["stockout_risk_flag"], color='darkred')
+        ax2.set_xlabel("At-Risk Sites", fontsize=10)
+        ax2.set_title("Top 10 Brands - Stockout Risk Alerts", fontsize=11, fontweight='bold')
+        ax2.invert_yaxis()
+        ax2.grid(axis='x', alpha=0.3)
+    
+    ax3 = plt.subplot(2, 2, 3)
+    if "risk_store_trait" in outputs and not outputs["risk_store_trait"].empty:
+        df = outputs["risk_store_trait"]
+        x = np.arange(len(df))
+        width = 0.35
+        ax3.bar(x - width/2, df["risk_gap"], width, label='Risk Gap', color='red', alpha=0.7)
+        ax3.bar(x + width/2, df["on_hand"], width, label='On Hand', color='green', alpha=0.7)
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(df["store_trait"].astype(str))
+        ax3.set_ylabel("Units", fontsize=10)
+        ax3.set_title("Inventory Position by Store Trait", fontsize=11, fontweight='bold')
+        ax3.legend()
+        ax3.grid(axis='y', alpha=0.3)
+    
+    ax4 = plt.subplot(2, 2, 4)
+    if "risk_state" in outputs and not outputs["risk_state"].empty:
+        df = outputs["risk_state"].copy()
+        df['coverage_ratio'] = df['on_hand'] / df['demand_horizon'].replace(0, 1)
+        df = df.sort_values("coverage_ratio", ascending=True).head(10)
+        colors = ['red' if x < 1 else 'green' for x in df['coverage_ratio']]
+        ax4.barh(df["state"].astype(str), df["coverage_ratio"], color=colors)
+        ax4.axvline(x=1.0, color='black', linestyle='--', linewidth=1, label='100% Coverage')
+        ax4.set_xlabel("Coverage Ratio (On Hand / Demand)", fontsize=10)
+        ax4.set_title("Bottom 10 States - Inventory Coverage", fontsize=11, fontweight='bold')
+        ax4.invert_yaxis()
+        ax4.legend()
+        ax4.grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    figs.append(fig3)
+    
+    # Chart 4: Distribution & Concentration Analysis
+    fig4 = plt.figure(figsize=(14, 10))
+    
+    ax1 = plt.subplot(2, 2, 1)
+    if "hhi_level_0" in outputs and not outputs["hhi_level_0"].empty:
+        df = outputs["hhi_level_0"].sort_values("hhi", ascending=False).head(15)
+        bars = ax1.bar(df["level_0"].astype(str), df["hhi"], color='purple')
+        ax1.set_ylabel("Average HHI", fontsize=10)
+        ax1.set_title("Inventory Concentration by Category (Top 15)", fontsize=11, fontweight='bold')
+        ax1.tick_params(axis='x', rotation=45, labelsize=8)
+        ax1.axhline(y=0.25, color='red', linestyle='--', linewidth=1, label='High Concentration Threshold')
+        ax1.legend()
+        ax1.grid(axis='y', alpha=0.3)
+    
+    ax2 = plt.subplot(2, 2, 2)
+    if "hhi_brand" in outputs and not outputs["hhi_brand"].empty:
+        df = outputs["hhi_brand"].sort_values("hhi_flag", ascending=False).head(10)
+        ax2.barh(df["brand"].astype(str), df["hhi_flag"], color='indigo')
+        ax2.set_xlabel("High Concentration Items", fontsize=10)
+        ax2.set_title("Top 10 Brands - Concentration Alerts", fontsize=11, fontweight='bold')
+        ax2.invert_yaxis()
+        ax2.grid(axis='x', alpha=0.3)
+    
+    ax3 = plt.subplot(2, 2, 3)
+    if "over_level_0" in outputs and not outputs["over_level_0"].empty:
+        df = outputs["over_level_0"].sort_values("on_hand", ascending=False).head(10)
+        ax3.barh(df["level_0"].astype(str), df["on_hand"], color='maroon')
+        ax3.set_xlabel("Over-Concentrated Units", fontsize=10)
+        ax3.set_title("Top 10 Categories - Over-Concentration", fontsize=11, fontweight='bold')
+        ax3.invert_yaxis()
+        ax3.grid(axis='x', alpha=0.3)
+    
+    ax4 = plt.subplot(2, 2, 4)
+    if "over_brand" in outputs and not outputs["over_brand"].empty:
+        df = outputs["over_brand"].sort_values("share_gap_pp", ascending=False).head(10)
+        ax4.barh(df["brand"].astype(str), df["share_gap_pp"], color='darkviolet')
+        ax4.axvline(x=20, color='red', linestyle='--', linewidth=2, label='Alert Threshold (20pp)')
+        ax4.set_xlabel("Average Share Gap (pp)", fontsize=10)
+        ax4.set_title("Top 10 Brands - Share Gap", fontsize=11, fontweight='bold')
+        ax4.invert_yaxis()
+        ax4.legend()
+        ax4.grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    figs.append(fig4)
+    
+    return figs
+
+############################
+# Optimized Engine         #
+############################
+def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = False):
+    """Optimized engine with separate hierarchy level aggregations"""
+    import time
+    start_time = time.time()
+    
+    if filters is None:
+        filters = {}
+    
+    required = ["file_current","file_wk5","file_next4","file_item_lookup","file_store_lookup"]
+    for k in required:
+        if not cfg.get(k) or not os.path.exists(cfg[k]):
+            raise FileNotFoundError(f"Path not found or missing in config: {k} -> {cfg.get(k)}")
+
+    print("\n=== CPFR Analysis Started ===")
+    print("Step 1/5: Loading data files...")
+    
+    # Use cached readers
+    df_current = read_current_cached(cfg["file_current"])
+    df_wk5 = read_wk5_cached(cfg["file_wk5"])
+    df_next4 = read_next4_cached(cfg["file_next4"])
+    
+    df_store_subcat = pd.DataFrame()
+    if cfg.get("file_store_subcat") and os.path.exists(cfg["file_store_subcat"]):
+        df_store_subcat = read_store_subcat_cached(cfg["file_store_subcat"])
+    
+    item_lookup = read_item_lookup_cached(cfg["file_item_lookup"])
+    store_lookup = read_store_lookup_cached(cfg["file_store_lookup"])
+    
+    print(f"  Loaded {len(df_current):,} current inventory records")
+    print(f"  Loaded {len(item_lookup):,} items and {len(store_lookup):,} stores")
+
+    print("\nStep 2/5: Enriching data with hierarchy...")
+    cur_enriched = safe_merge(df_current, item_lookup, on=["client_item_nbr"], how="left")
+    cur_enriched = safe_merge(cur_enriched, store_lookup, on=["store_id"], how="left")
+    cur_enriched = normalize_keys(cur_enriched)
+    cur_enriched = optimize_dtypes(cur_enriched)
+
+    # Apply valid item-trait filter if provided
+    valid_path = cfg.get("file_valid_item_trait", "")
+    if valid_path and os.path.exists(valid_path):
+        valid = read_valid_item_trait_cached(valid_path)
+        before = len(cur_enriched)
+        cur_enriched = safe_merge(cur_enriched, valid, on=["item_id","store_trait"], how="inner")
+        after = len(cur_enriched)
+        allowed_keys = cur_enriched[["store_id","client_item_nbr"]].drop_duplicates()
+        df_current = safe_merge(df_current, allowed_keys, on=["store_id","client_item_nbr"], how="inner")
+        print(f"  Applied Valid Item–Trait filter: kept {after:,} of {before:,} records ({100*after/before:.1f}%)")
+
+    # Apply hierarchy filters
+    if any(filters.values()):
+        print("  Applying hierarchy filters...")
+        before = len(cur_enriched)
+        cur_enriched = apply_hierarchy_filters(cur_enriched, filters)
+        df_current = apply_hierarchy_filters(df_current, filters)
+        after = len(cur_enriched)
+        print(f"  Filtered to {after:,} records ({100*after/before:.1f}% of previous)")
+
+    # Store dataframes for filter options
+    dataframes = {"cur_enriched": cur_enriched}
+
+    print("\nStep 3/5: Computing KPIs by hierarchy levels...")
+    
+    # In-stock analysis - separate for each level
+    print("  - In-stock metrics (by Store Trait, State, Level_0, Brand, Item)")
+    instock_by_levels = compute_instock_by_levels(cur_enriched)
+    
+    # Inventory alerts
+    print("  - Slow movers (by hierarchy levels)")
+    slow_by_levels = compute_slow_movers_by_levels(cur_enriched, df_wk5)
+    
+    print("  - Min/Safety compliance (by hierarchy levels)")
+    compliance_by_levels = compute_compliance_by_levels(cur_enriched)
+
+    # Forecast & Risk
+    print("  - Forecast with uplift")
+    df_fc = compute_forecast(cur_enriched, df_next4, df_store_subcat)
+    
+    print("  - Forecast aggregation (by hierarchy levels)")
+    forecast_by_levels = compute_forecast_by_levels(df_fc)
+    
+    print("  - Stockout risk analysis (by hierarchy levels)")
+    risk_by_levels = compute_risk_by_levels(df_fc, 
+                                  lead_time_wks=int(cfg.get("lead_time_wks",2)), 
+                                  buffer_wks=float(cfg.get("buffer_wks",0.5)))
+
+    # Distribution
+    print("  - Distribution concentration (by hierarchy levels)")
+    hhi_by_levels, over_by_levels = compute_distribution_by_levels(df_current, df_store_subcat, item_lookup, store_lookup,
+                                                       hhi_threshold=float(cfg.get("hhi_threshold",0.25)),
+                                                       share_excess_pp=float(cfg.get("share_excess_pp",20.0)))
+
+    print("\nStep 4/5: Preparing outputs...")
+    
+    # Prepare output dictionary with all hierarchy levels
+    outputs = {}
+    
+    # In-stock
+    for level_col, df in instock_by_levels.items():
+        outputs[f"instock_{level_col}"] = df
+    
+    # Slow movers
+    for level_col, df in slow_by_levels.items():
+        outputs[f"slow_{level_col}"] = df
+    
+    # Compliance
+    for level_col, df in compliance_by_levels.items():
+        outputs[f"compliance_{level_col}"] = df
+    
+    # Forecast
+    for level_col, df in forecast_by_levels.items():
+        outputs[f"forecast_{level_col}"] = df
+    
+    # Risk
+    for level_col, df in risk_by_levels.items():
+        outputs[f"risk_{level_col}"] = df
+    
+    # HHI
+    for level_col, df in hhi_by_levels.items():
+        outputs[f"hhi_{level_col}"] = df
+    
+    # Over-concentration
+    for level_col, df in over_by_levels.items():
+        outputs[f"over_{level_col}"] = df
+    
+    # Export to CSV
+    print("  - Exporting CSV files...")
+    paths = []
+    
+    for key, df in outputs.items():
+        if not df.empty:
+            fname = f"{key}.csv"
+            path = os.path.join(EXPORT_DIR, fname)
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            paths.append(path)
+    
+    print(f"    ✓ Exported {len(paths)} CSV files")
+    
+    # Optional: Export store-item detail if requested
+    if show_store_item:
+        print("  - Exporting store-item detail (this may take longer)...")
+        detail_cols = ["store_id", "client_item_nbr", "item_id", "brand", "level_0", "store_name", 
+                      "state", "store_trait", "on_hand", "sales_last4"]
+        available_cols = [c for c in detail_cols if c in cur_enriched.columns]
+        store_item_detail = cur_enriched[available_cols].copy()
+        detail_path = os.path.join(EXPORT_DIR, "store_item_detail.csv")
+        store_item_detail.to_csv(detail_path, index=False, encoding="utf-8-sig")
+        paths.append(detail_path)
+        print(f"    ✓ store_item_detail.csv ({len(store_item_detail):,} rows)")
+
+    print("\nStep 5/5: Generating charts...")
+    figs = create_enhanced_charts(outputs)
+    print(f"  ✓ Generated {len(figs)} chart panels")
+
+    elapsed = time.time() - start_time
+    print(f"\n=== Analysis Complete in {elapsed:.1f} seconds ===\n")
+
+    return outputs, paths, figs, dataframes
+
+############################
+# Gradio UI                #
+############################
+def launch_gradio():
+    try:
+        import gradio as gr
+    except Exception:
+        print("Install Gradio: pip install gradio")
+        raise
+
+    cfg = load_config("cpfr_config.json")
+
+    with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft()) as demo:
+        gr.Markdown(f"# {APP_TITLE}\n**Optimized with separate hierarchy level aggregations and actionable CPFR charts.**")
+        
+        # Store filter state
+        dataframes_state = gr.State({})
+
+        # File paths
+        with gr.Row():
+            file_current_p = gr.Textbox(value=cfg.get("file_current",""), label="Path: Current Inventory + L4W (.xlsx)")
+            file_wk5_p = gr.Textbox(value=cfg.get("file_wk5",""), label="Path: Inventory 5 Weeks Ago (.xlsx)")
+            file_next4_p = gr.Textbox(value=cfg.get("file_next4",""), label="Path: Sell-Out N4W (.xlsx)")
+        with gr.Row():
+            file_store_subcat_p = gr.Textbox(value=cfg.get("file_store_subcat",""), label="Path: Subcategory-Store Sell-Out (.xlsx, optional)")
+            file_item_lookup_p = gr.Textbox(value=cfg.get("file_item_lookup",""), label="Path: Item Lookup (.csv)")
+            file_store_lookup_p = gr.Textbox(value=cfg.get("file_store_lookup",""), label="Path: Store Lookup (.csv)")
+        with gr.Row():
+            file_valid_item_trait_p = gr.Textbox(value=cfg.get("file_valid_item_trait",""), label="Path: Valid (Item, Store Trait) combinations (.xlsx, optional)")
+        
+        # Hierarchy Filters
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### 🔍 Hierarchy Filters")
+                with gr.Row():
+                    store_trait_filter = gr.Dropdown(label="Store Trait", choices=[], multiselect=True, interactive=True)
+                    state_filter = gr.Dropdown(label="State", choices=[], multiselect=True, interactive=True)
+                with gr.Row():
+                    level0_filter = gr.Dropdown(label="Level_0", choices=[], multiselect=True, interactive=True)
+                    brand_filter = gr.Dropdown(label="Brand", choices=[], multiselect=True, interactive=True)
+                with gr.Row():
+                    item_filter = gr.Dropdown(label="Item Mattel", choices=[], multiselect=True, interactive=True)
+                    show_store_item_check = gr.Checkbox(label="Export Store-Item Detail (slower)", value=False, info="Enable to get granular store-item level data")
+        
+        # Parameters
+        with gr.Row():
+            lead_p = gr.Slider(1, 4, value=cfg.get("lead_time_wks",2), step=1, label="Lead Time (weeks)")
+            buffer_p = gr.Slider(0.0, 2.0, value=cfg.get("buffer_wks",0.5), step=0.1, label="Buffer Coverage (weeks)")
+        with gr.Row():
+            hhi_thr_p = gr.Slider(0.05, 1.00, value=cfg.get("hhi_threshold",0.25), step=0.01, label="HHI Flag Threshold (0–1)")
+            share_pp_p = gr.Slider(1.0, 100.0, value=cfg.get("share_excess_pp",20.0), step=1.0, label="Over-Concentration Threshold (pp)")
+
+        # Action buttons
+        with gr.Row():
+            save_btn = gr.Button("💾 Save Config", variant="secondary")
+            run_btn = gr.Button("🚀 Run Analysis", variant="primary", size="lg")
+        
+        save_status = gr.Textbox(label="Config Save Status", value="")
+
+        # Results tabs - ORGANIZED BY HIERARCHY LEVEL
+        with gr.Tab("📊 In-Stock Analysis"):
+            gr.Markdown("**Results by each hierarchy level independently**")
+            with gr.Accordion("By Store Trait", open=True):
+                t_instock_trait = gr.Dataframe(label="In-Stock by Store Trait", wrap=True)
+            with gr.Accordion("By State", open=False):
+                t_instock_state = gr.Dataframe(label="In-Stock by State", wrap=True)
+            with gr.Accordion("By Level_0", open=False):
+                t_instock_level0 = gr.Dataframe(label="In-Stock by Level_0", wrap=True)
+            with gr.Accordion("By Brand", open=False):
+                t_instock_brand = gr.Dataframe(label="In-Stock by Brand", wrap=True)
+            with gr.Accordion("By Item Mattel", open=False):
+                t_instock_item = gr.Dataframe(label="In-Stock by Item Mattel", wrap=True)
+        
+        with gr.Tab("🚨 Inventory Alerts"):
+            gr.Markdown("**Slow movers and compliance issues by hierarchy level**")
+            with gr.Accordion("Slow Movers - By Store Trait", open=True):
+                t_slow_trait = gr.Dataframe(label="Slow Movers by Store Trait", wrap=True)
+            with gr.Accordion("Slow Movers - By State", open=False):
+                t_slow_state = gr.Dataframe(label="Slow Movers by State", wrap=True)
+            with gr.Accordion("Slow Movers - By Level_0", open=False):
+                t_slow_level0 = gr.Dataframe(label="Slow Movers by Level_0", wrap=True)
+            with gr.Accordion("Slow Movers - By Brand", open=False):
+                t_slow_brand = gr.Dataframe(label="Slow Movers by Brand", wrap=True)
+            
+            gr.Markdown("---")
+            
+            with gr.Accordion("Min/Safety Compliance - By Store Trait", open=True):
+                t_comp_trait = gr.Dataframe(label="Compliance by Store Trait", wrap=True)
+            with gr.Accordion("Min/Safety Compliance - By State", open=False):
+                t_comp_state = gr.Dataframe(label="Compliance by State", wrap=True)
+            with gr.Accordion("Min/Safety Compliance - By Level_0", open=False):
+                t_comp_level0 = gr.Dataframe(label="Compliance by Level_0", wrap=True)
+            with gr.Accordion("Min/Safety Compliance - By Brand", open=False):
+                t_comp_brand = gr.Dataframe(label="Compliance by Brand", wrap=True)
+        
+        with gr.Tab("📈 Forecast & Risk"):
+            gr.Markdown("**Forecast and stockout risk by hierarchy level**")
+            with gr.Accordion("Forecast - By Store Trait", open=True):
+                t_fc_trait = gr.Dataframe(label="Forecast by Store Trait", wrap=True)
+            with gr.Accordion("Forecast - By State", open=False):
+                t_fc_state = gr.Dataframe(label="Forecast by State", wrap=True)
+            with gr.Accordion("Forecast - By Level_0", open=False):
+                t_fc_level0 = gr.Dataframe(label="Forecast by Level_0", wrap=True)
+            with gr.Accordion("Forecast - By Brand", open=False):
+                t_fc_brand = gr.Dataframe(label="Forecast by Brand", wrap=True)
+            
+            gr.Markdown("---")
+            
+            with gr.Accordion("Stockout Risk - By Store Trait", open=True):
+                t_risk_trait = gr.Dataframe(label="Risk by Store Trait", wrap=True)
+            with gr.Accordion("Stockout Risk - By State", open=False):
+                t_risk_state = gr.Dataframe(label="Risk by State", wrap=True)
+            with gr.Accordion("Stockout Risk - By Level_0", open=False):
+                t_risk_level0 = gr.Dataframe(label="Risk by Level_0", wrap=True)
+            with gr.Accordion("Stockout Risk - By Brand", open=False):
+                t_risk_brand = gr.Dataframe(label="Risk by Brand", wrap=True)
+        
+        with gr.Tab("🎯 Distribution Insights"):
+            gr.Markdown("**Distribution concentration metrics by hierarchy level**")
+            with gr.Accordion("HHI Concentration - By Store Trait", open=True):
+                t_hhi_trait = gr.Dataframe(label="HHI by Store Trait", wrap=True)
+            with gr.Accordion("HHI Concentration - By State", open=False):
+                t_hhi_state = gr.Dataframe(label="HHI by State", wrap=True)
+            with gr.Accordion("HHI Concentration - By Level_0", open=False):
+                t_hhi_level0 = gr.Dataframe(label="HHI by Level_0", wrap=True)
+            with gr.Accordion("HHI Concentration - By Brand", open=False):
+                t_hhi_brand = gr.Dataframe(label="HHI by Brand", wrap=True)
+            
+            gr.Markdown("---")
+            
+            with gr.Accordion("Over-Concentration - By Store Trait", open=True):
+                t_over_trait = gr.Dataframe(label="Over-Concentration by Store Trait", wrap=True)
+            with gr.Accordion("Over-Concentration - By State", open=False):
+                t_over_state = gr.Dataframe(label="Over-Concentration by State", wrap=True)
+            with gr.Accordion("Over-Concentration - By Level_0", open=False):
+                t_over_level0 = gr.Dataframe(label="Over-Concentration by Level_0", wrap=True)
+            with gr.Accordion("Over-Concentration - By Brand", open=False):
+                t_over_brand = gr.Dataframe(label="Over-Concentration by Brand", wrap=True)
+        
+        with gr.Tab("📉 CPFR Charts"):
+            gr.Markdown("### Actionable CPFR Visual Analytics")
+            gr.Markdown("**Chart 1: In-Stock Performance Analysis**")
+            p1 = gr.Plot(label="In-Stock by Store Trait & Top Categories")
+            gr.Markdown("**Chart 2: Inventory Alerts Dashboard**")
+            p2 = gr.Plot(label="Slow Movers, Below Min/Safety Alerts")
+            gr.Markdown("**Chart 3: Stockout Risk Analysis**")
+            p3 = gr.Plot(label="Risk Scores, Coverage Ratios, At-Risk Sites")
+            gr.Markdown("**Chart 4: Distribution & Concentration**")
+            p4 = gr.Plot(label="HHI Concentration, Over-Concentration Analysis")
+        
+        with gr.Tab("📥 Downloads"):
+            files = gr.Files(label="CSV Outputs")
+            gr.Markdown("*All files contain hierarchy-level aggregated data*")
+
+        # Save config function
+        def save_cfg(file_current, file_wk5, file_next4, file_store_subcat, file_item_lookup, file_store_lookup, file_valid_item_trait, lead, buffer, hhi_thr, share_pp):
+            cfg_upd = {
+                "file_current": file_current, "file_wk5": file_wk5, "file_next4": file_next4,
+                "file_store_subcat": file_store_subcat, "file_item_lookup": file_item_lookup, "file_store_lookup": file_store_lookup,
+                "file_valid_item_trait": file_valid_item_trait,
+                "lead_time_wks": lead, "buffer_wks": buffer, "hhi_threshold": hhi_thr, "share_excess_pp": share_pp
+            }
+            save_config("cpfr_config.json", cfg_upd)
+            return gr.update(value="✅ Config saved to cpfr_config.json")
+
+        # Update filters function
+        def update_filters(dataframes):
+            filter_options = get_filter_options(dataframes)
+            return (
+                gr.update(choices=filter_options["store_trait"]),
+                gr.update(choices=filter_options["state"]),
+                gr.update(choices=filter_options["level_0"]),
+                gr.update(choices=filter_options["brand"]),
+                gr.update(choices=filter_options["item_id"])
+            )
+
+        # Run analysis function
+        def _run(file_current, file_wk5, file_next4, file_store_subcat, file_item_lookup, file_store_lookup, 
+                file_valid_item_trait, lead, buffer, hhi_thr, share_pp, store_trait, state, level0, brand, item, show_detail):
+            
+            # Prepare filters
+            filters = {
+                "store_trait": store_trait if store_trait else [],
+                "state": state if state else [],
+                "level_0": level0 if level0 else [],
+                "brand": brand if brand else [],
+                "item_id": item if item else []
+            }
+            
+            cfg = {
+                "file_current": file_current, "file_wk5": file_wk5, "file_next4": file_next4,
+                "file_store_subcat": file_store_subcat, "file_item_lookup": file_item_lookup, "file_store_lookup": file_store_lookup,
+                "file_valid_item_trait": file_valid_item_trait,
+                "lead_time_wks": lead, "buffer_wks": buffer, "hhi_threshold": hhi_thr, "share_excess_pp": share_pp
+            }
+            
+            try:
+                outputs, paths, figs, dataframes = run_engine_paths(cfg, filters, show_store_item=show_detail)
+                
+                # Update filter options
+                filter_updates = update_filters(dataframes)
+                
+                # Helper to get dataframe or empty
+                def get_df(key):
+                    return outputs.get(key, pd.DataFrame())
+                
+                return (
+                    # In-stock
+                    get_df("instock_store_trait"),
+                    get_df("instock_state"),
+                    get_df("instock_level_0"),
+                    get_df("instock_brand"),
+                    get_df("instock_item_id"),
+                    # Slow movers
+                    get_df("slow_store_trait"),
+                    get_df("slow_state"),
+                    get_df("slow_level_0"),
+                    get_df("slow_brand"),
+                    # Compliance
+                    get_df("compliance_store_trait"),
+                    get_df("compliance_state"),
+                    get_df("compliance_level_0"),
+                    get_df("compliance_brand"),
+                    # Forecast
+                    get_df("forecast_store_trait"),
+                    get_df("forecast_state"),
+                    get_df("forecast_level_0"),
+                    get_df("forecast_brand"),
+                    # Risk
+                    get_df("risk_store_trait"),
+                    get_df("risk_state"),
+                    get_df("risk_level_0"),
+                    get_df("risk_brand"),
+                    # HHI
+                    get_df("hhi_store_trait"),
+                    get_df("hhi_state"),
+                    get_df("hhi_level_0"),
+                    get_df("hhi_brand"),
+                    # Over-concentration
+                    get_df("over_store_trait"),
+                    get_df("over_state"),
+                    get_df("over_level_0"),
+                    get_df("over_brand"),
+                    # Charts
+                    figs[0] if len(figs) > 0 else None,
+                    figs[1] if len(figs) > 1 else None,
+                    figs[2] if len(figs) > 2 else None,
+                    figs[3] if len(figs) > 3 else None,
+                    # Files
+                    paths,
+                    # Filter updates
+                    *filter_updates,
+                    # Dataframes state
+                    dataframes
+                )
+            except Exception as e:
+                import traceback
+                error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
+                print(error_msg)
+                empty_df = pd.DataFrame()
+                return tuple([empty_df] * 28 + [None, None, None, None, []] + [gr.update()] * 5 + [{}])
+
+        # Connect buttons
+        save_btn.click(
+            save_cfg,
+            inputs=[file_current_p, file_wk5_p, file_next4_p, file_store_subcat_p, file_item_lookup_p, 
+                   file_store_lookup_p, file_valid_item_trait_p, lead_p, buffer_p, hhi_thr_p, share_pp_p],
+            outputs=[save_status]
+        )
+
+        run_btn.click(
+            _run,
+            inputs=[file_current_p, file_wk5_p, file_next4_p, file_store_subcat_p, file_item_lookup_p,
+                   file_store_lookup_p, file_valid_item_trait_p, lead_p, buffer_p, hhi_thr_p, share_pp_p,
+                   store_trait_filter, state_filter, level0_filter, brand_filter, item_filter, show_store_item_check],
+            outputs=[
+                # In-stock (5)
+                t_instock_trait, t_instock_state, t_instock_level0, t_instock_brand, t_instock_item,
+                # Slow movers (4)
+                t_slow_trait, t_slow_state, t_slow_level0, t_slow_brand,
+                # Compliance (4)
+                t_comp_trait, t_comp_state, t_comp_level0, t_comp_brand,
+                # Forecast (4)
+                t_fc_trait, t_fc_state, t_fc_level0, t_fc_brand,
+                # Risk (4)
+                t_risk_trait, t_risk_state, t_risk_level0, t_risk_brand,
+                # HHI (4)
+                t_hhi_trait, t_hhi_state, t_hhi_level0, t_hhi_brand,
+                # Over-concentration (4)
+                t_over_trait, t_over_state, t_over_level0, t_over_brand,
+                # Charts (4)
+                p1, p2, p3, p4,
+                # Files (1)
+                files,
+                # Filters (5)
+                store_trait_filter, state_filter, level0_filter, brand_filter, item_filter,
+                # State (1)
+                dataframes_state
+            ]
+        )
+
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
+
+if __name__ == "__main__":
+    launch_gradio()
