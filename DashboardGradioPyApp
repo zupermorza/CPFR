@@ -1,1192 +1,1428 @@
+"""
+CPFR KPI Tracking Pipeline - V3 (Action-Driving + Time Semantics + Confidence)
+
+Aligned to canonical datasets with STAR model:
+- DIM_ITEM: Item catalog (1 row per client_item_nbr)
+- DIM_STORE: Store catalog (1 row per store_id)
+- F_STORE_ITEM_LY: Multi-week LY sell-out (store × item × week)
+- F_STORE_ITEM_CURRENT: Current snapshot (store × item + inventory + LW sellout)
+- F_STORE_SUBCATEGORY_SEASON: Seasonal store-subcategory demand (allocation proxy)
+- F_ACTIVE_STORE_ITEM: Active store-item combinations (MANDATORY FILTER)
+
+Gold Fact: F_STORE_ITEM_WEEK (store × item × week with KPIs, flags, confidence)
+
+Major upgrades vs V2:
+1) Action-driving dictionary layer (KPI/flag → owner/action/priority/templates) via kpi_action_map.json
+2) Explicit time semantics:
+   - sellout_units_ly_yoy = same-week LY comparator (used for YoY)
+   - history_weeks/history_units/history_cv = multi-week LY evidence window (used for confidence + low_history)
+3) KPI confidence signal: HIGH / MEDIUM / LOW
+"""
+
+from __future__ import annotations
+
 import os
 import json
+import re
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from typing import List, Tuple, Dict, Optional
+from typing import List, Dict, Any, Optional
 from functools import lru_cache
 import warnings
-warnings.filterwarnings('ignore')
 
-APP_TITLE = "CPFR Store–Item Analysis - OPTIMIZED"
-EXPORT_DIR = "cpfr_outputs"
+warnings.filterwarnings("ignore")
+
+APP_TITLE = "CPFR KPI Tracking Pipeline - V3"
+EXPORT_DIR = "kpi_outputs"
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 ########################
-# Config               #
+# CONFIG               #
 ########################
-DEFAULT_CONFIG = {
-    "file_current": "",
-    "file_wk5": "",
-    "file_next4": "",
-    "file_store_subcat": "",
-    "file_item_lookup": "",
-    "file_store_lookup": "",
-    "file_valid_item_trait": "",
-    "lead_time_wks": 2,
-    "buffer_wks": 0.5,
-    "hhi_threshold": 0.25,
-    "share_excess_pp": 20.0
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "file_dim_item": "",                    # DIM_ITEM: Item catalog
+    "file_dim_store": "",                   # DIM_STORE: Store catalog
+    "file_f_store_item_ly": "",             # F_STORE_ITEM_LY: Multi-week LY sell-out
+    "file_f_store_item_current": "",        # F_STORE_ITEM_CURRENT: Current snapshot
+    "file_f_store_subcategory_season": "",  # F_STORE_SUBCATEGORY_SEASON: Seasonal demand
+    "file_f_active_store_item": "",         # F_ACTIVE_STORE_ITEM: Active combinations (MANDATORY)
+
+    "week_id": "",                          # Analysis week ID (e.g., "202526")
+    "as_of_date": "",                       # Snapshot date (e.g., "2025-06-30")
+
+    # Explicit time semantics
+    "yoy_week_id_ly": "",                   # LY week ID to use as YoY comparator (override if needed)
+    "history_window_weeks": 26,             # Multi-week evidence window length (e.g., 13/26/52)
+
+    # Rules / action mapping
+    "kpi_rules_file": "kpi_rules.json",     # KPI thresholds
+    "action_map_file": "kpi_action_map.json",
+
+    # Export
+    "export_parquet": False                 # Optional parquet export
+}
+
+DEFAULT_KPI_RULES: Dict[str, Any] = {
+    "coverage_target_days": 14,
+    "min_safety_stock_days": 7,
+    "overstock_threshold_days": 60,
+    "service_level_target": 0.95,
+
+    # History / confidence
+    "new_item_history_threshold_weeks": 4,
+    "low_history_threshold_units": 10,
+    "high_confidence_units_multiplier": 3,     # HIGH if history_units >= low_history_threshold_units * multiplier
+    "history_volatility_cv_threshold": 1.5     # MEDIUM if volatility above this (std/mean)
+}
+
+DEFAULT_ACTION_MAP: Dict[str, Any] = {
+    "priority_rank": {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4},
+    "flag_actions": {
+        "oos_risk_flag": {
+            "owner": ["CPFR", "Ops"],
+            "action": "Replenish now / protect promo",
+            "priority": "CRITICAL",
+            "rationale_template": "Coverage {coverage_days:.0f}d below safety ({min_safety_stock_days}d) or inv=0 with sellout.",
+            "next_step_template": "Raise replenishment to reach target {coverage_target_days}d; validate DC availability + lead time."
+        },
+        "overstock_flag": {
+            "owner": ["Sales", "CPFR"],
+            "action": "Halt invoicing / rebalance",
+            "priority": "MEDIUM",
+            "rationale_template": "Coverage {coverage_days:.0f}d above overstock threshold ({overstock_threshold_days}d).",
+            "next_step_template": "Stop shipment; propose transfers/rebalance; consider markdown/promo where needed."
+        },
+        "low_history_flag": {
+            "owner": ["CPFR"],
+            "action": "Use seasonality weights / treat KPIs as low confidence",
+            "priority": "HIGH",
+            "rationale_template": "Insufficient history: weeks={history_weeks}, units={history_units:.0f}.",
+            "next_step_template": "Use store-subcategory seasonal weights for allocation; monitor early sellout signals."
+        }
+    },
+    "store_item_actions_top_n": 50,
+    "downrank_low_confidence": True
 }
 
 def load_config(path: str) -> dict:
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="latin-1") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             return {**DEFAULT_CONFIG, **cfg}
         except Exception:
             return DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
 
-def save_config(path: str, cfg: dict) -> None:
-    with open(path, "w", encoding="latin-1") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+def load_json_with_defaults(path: str, defaults: Dict[str, Any]) -> Dict[str, Any]:
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {**defaults, **data}
+        except Exception:
+            return defaults.copy()
+    return defaults.copy()
+
+def load_kpi_rules(path: str) -> dict:
+    """Load KPI thresholds (config-driven, UI-overridable)"""
+    rules = load_json_with_defaults(path, DEFAULT_KPI_RULES)
+    # Ensure notes don't break numeric access
+    rules.pop("notes", None)
+    return rules
+
+def load_action_map(path: str) -> dict:
+    """Load action map for KPI/flag ownership + intent."""
+    action_map = load_json_with_defaults(path, DEFAULT_ACTION_MAP)
+    action_map.pop("notes", None)
+    # Merge nested dicts cleanly
+    if "priority_rank" not in action_map:
+        action_map["priority_rank"] = DEFAULT_ACTION_MAP["priority_rank"]
+    if "flag_actions" not in action_map:
+        action_map["flag_actions"] = DEFAULT_ACTION_MAP["flag_actions"]
+    return action_map
 
 ########################
-# Utilities            #
+# UTILITIES            #
 ########################
-TRAIT_MAP = {9: "BA", 1312: "MIBO", 969: "BAE", 297: "SC"}
-SMALL_TRAITS = {"BAE","MIBO"}
-HIERARCHY_LEVELS = {
-    "store_trait": "Store Trait",
-    "state": "State", 
-    "level_0": "Level_0",
-    "brand": "Brand",
-    "item_id": "Item Mattel"
-}
 
 def lower_cols(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.strip().lower() for c in df.columns]
     return df
 
 def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert to efficient data types to reduce memory usage"""
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            if col in ['store_id', 'client_item_nbr', 'item_id', 'store_trait', 'state', 'brand', 'level_0', 'subcategory']:
-                df[col] = df[col].astype('category')
-        elif df[col].dtype == 'float64':
-            df[col] = pd.to_numeric(df[col], downcast='float')
-        elif df[col].dtype == 'int64':
-            df[col] = pd.to_numeric(df[col], downcast='integer')
+    """Reduce memory footprint"""
+    for col in df.select_dtypes(include=["float64"]).columns:
+        df[col] = pd.to_numeric(df[col], downcast="float")
+    for col in df.select_dtypes(include=["int64"]).columns:
+        df[col] = pd.to_numeric(df[col], downcast="integer")
     return df
 
 def normalize_keys(df: pd.DataFrame) -> pd.DataFrame:
-    for key in ["store_id","item_id","client_item_nbr"]:
-        if key in df.columns:
-            df[key] = df[key].astype(str).str.strip()
+    """Standardize key columns"""
     if "store_id" in df.columns:
-        df["store_id"] = df["store_id"].str.replace(r"\.0$", "", regex=True)
-    if "store_trait" in df.columns:
-        st = pd.to_numeric(df["store_trait"], errors="coerce")
-        mapped = st.map(TRAIT_MAP)
-        df["store_trait"] = mapped.fillna(df["store_trait"].astype(str).str.strip())
+        df["store_id"] = df["store_id"].astype(str).str.strip().str.upper()
+    if "client_item_nbr" in df.columns:
+        df["client_item_nbr"] = df["client_item_nbr"].astype(str).str.strip()
+    if "week_id" in df.columns:
+        df["week_id"] = df["week_id"].astype(str).str.strip()
+    if "week_id_ly_yoy" in df.columns:
+        df["week_id_ly_yoy"] = df["week_id_ly_yoy"].astype(str).str.strip()
     return df
 
 def clip_nonneg(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0)
+    """Ensure non-negative values"""
+    for col in cols:
+        if col in df.columns:
+            df[col] = df[col].clip(lower=0)
     return df
 
-def dedup_sum(df: pd.DataFrame, keys: List[str], sum_cols: List[str], max_cols: List[str] = None) -> pd.DataFrame:
+def dedup_sum(df: pd.DataFrame, keys: List[str], sum_cols: List[str]) -> pd.DataFrame:
+    """Deduplicate and aggregate by summing"""
     agg_dict = {c: "sum" for c in sum_cols if c in df.columns}
-    if max_cols:
-        for c in max_cols:
-            if c in df.columns:
-                agg_dict[c] = "max"
     return df.groupby(keys, dropna=False, as_index=False, observed=True).agg(agg_dict)
 
 def safe_merge(left: pd.DataFrame, right: pd.DataFrame, on: List[str], how: str = "left") -> pd.DataFrame:
-    right_dedup = right.drop_duplicates(on)
+    """Merge with automatic right-side deduplication"""
+    right_dedup = right.drop_duplicates(subset=on)
     return pd.merge(left, right_dedup, on=on, how=how)
 
-def format_percentages(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert decimal percentages to percentage format with 1 decimal"""
-    percent_cols = [col for col in df.columns if any(x in col.lower() for x in ['pct', 'percent', 'rate', 'ratio', 'instock'])]
-    for col in percent_cols:
-        if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-            df[col] = (df[col] * 100).round(1)
-    return df
+def digits_only(s: Any) -> str:
+    return re.sub(r"\D", "", str(s or ""))
 
-def round_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    """Round all numeric columns to 1 decimal place"""
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    for col in numeric_cols:
-        df[col] = df[col].round(1)
-    return df
+def compute_default_yoy_week_id_ly(current_week_id: str) -> str:
+    """
+    Best-effort default:
+    - If current_week_id contains digits like YYYYWW, return (YYYY-1)WW.
+    - Else, if current_week_id contains any digits (e.g., '26' or 'W26'), return current_week_id as-is.
+      (This supports retailer week schemas where week_id is week-number-only.)
+    - Else return empty (requires config override or calendar bridge).
+    """
+    d = digits_only(current_week_id)
+    if len(d) >= 6:
+        year = int(d[:4])
+        wk = d[4:]
+        return f"{year-1}{wk}"
+    if len(d) > 0:
+        return str(current_week_id).strip()
+    return ""
 
-def apply_hierarchy_filters(df: pd.DataFrame, filters: Dict) -> pd.DataFrame:
-    """Apply hierarchy filters to dataframe"""
-    if df.empty:
-        return df
-    
-    for filter_col, filter_values in filters.items():
-        if filter_col in df.columns and filter_values:
-            df = df[df[filter_col].isin(filter_values)]
-    
-    return df
+def try_parse_year_week(week_id: str) -> Optional[tuple[int, int]]:
+    """
+    Best-effort parse of YYYYWW (or YYYYWWW) after removing non-digits.
+    Returns (year, week) or None if parse fails.
+    """
+    d = digits_only(week_id)
+    if len(d) >= 6:
+        year = int(d[:4])
+        wk = int(d[4:])
+        return year, wk
+    return None
 
-########################
-# Cached Readers       #
-########################
-@lru_cache(maxsize=1)
-def read_current_cached(file: str) -> pd.DataFrame:
-    print(f"  Loading current inventory...")
-    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
-    rename_map = {}
-    if "item nbr" in df.columns: rename_map["item nbr"] = "client_item_nbr"
-    if "store nbr" in df.columns: rename_map["store nbr"] = "store_id"
-    if "pos qty" in df.columns: rename_map["pos qty"] = "sales_last4"
-    if "total inv" in df.columns: rename_map["total inv"] = "on_hand"
-    if "sel store trait" in df.columns: rename_map["sel store trait"] = "store_trait"
-    df = df.rename(columns=rename_map)
-    drop_cols = [c for c in df.columns if c.strip().lower() == "item flags"]
-    if drop_cols: df = df.drop(columns=drop_cols)
-    df = clip_nonneg(df, ["on_hand","sales_last4"])
-    df = normalize_keys(df)
-    df = dedup_sum(df, keys=["store_id","client_item_nbr"], sum_cols=["on_hand","sales_last4"])
-    df = optimize_dtypes(df)
-    return df
-
-@lru_cache(maxsize=1)
-def read_wk5_cached(file: str) -> pd.DataFrame:
-    print(f"  Loading week -5 inventory...")
-    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
-    rename_map = {}
-    if "item nbr" in df.columns: rename_map["item nbr"] = "client_item_nbr"
-    if "store nbr" in df.columns: rename_map["store nbr"] = "store_id"
-    if "hist on hand qty" in df.columns: rename_map["hist on hand qty"] = "on_hand_wk_-5"
-    df = df.rename(columns=rename_map)
-    df = clip_nonneg(df, ["on_hand_wk_-5"])
-    df = normalize_keys(df)
-    df = dedup_sum(df, keys=["store_id","client_item_nbr"], sum_cols=["on_hand_wk_-5"])
-    df = optimize_dtypes(df)
-    return df
-
-@lru_cache(maxsize=1)
-def read_next4_cached(file: str) -> pd.DataFrame:
-    print(f"  Loading forecast N4W...")
-    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
-    rename_map = {}
-    if "item nbr" in df.columns: rename_map["item nbr"] = "client_item_nbr"
-    if "store nbr" in df.columns: rename_map["store nbr"] = "store_id"
-    if "pos qty" in df.columns: rename_map["pos qty"] = "n4w"
-    df = df.rename(columns=rename_map)
-    df = clip_nonneg(df, ["n4w"])
-    df = normalize_keys(df)
-    df = dedup_sum(df, keys=["store_id","client_item_nbr"], sum_cols=["n4w"])
-    df = optimize_dtypes(df)
-    return df
-
-@lru_cache(maxsize=1)
-def read_item_lookup_cached(file: str) -> pd.DataFrame:
-    print(f"  Loading item lookup...")
+def safe_format(template: str, context: Dict[str, Any]) -> str:
+    """Format templates without hard failures."""
+    if not isinstance(template, str) or not template:
+        return ""
     try:
-        try:
-            df = pd.read_csv(file, encoding="utf-8-sig")
-        except Exception:
-            df = pd.read_csv(file, encoding="latin-1")
-        df = lower_cols(df)
-        rename_map = {}
-        for col in df.columns:
-            if col.strip().lower() in ["item nbr","item_nbr","item  nbr"]:
-                rename_map[col] = "client_item_nbr"
-                break
-        if "item mattel" in df.columns: rename_map["item mattel"] = "item_id"
-        if "subcategoria" in df.columns: rename_map["subcategoria"] = "subcategory"
-        if "sub-category" in df.columns: rename_map["sub-category"] = "subcategory"
-        if "level_0" in df.columns: rename_map["level_0"] = "level_0"
-        for col in df.columns:
-            lc = col.lower()
-            if ("año" in lc) or ("aÃ±o" in lc) or ("aÃ£Â±o" in lc) or (lc == "ano"):
-                rename_map[col] = "year"
-                break
-        df = df.rename(columns=rename_map)
-        if "brand" not in df.columns:
-            df["brand"] = "Unknown"
-        keep = [c for c in ["item_id","client_item_nbr","brand","subcategory","year","level_0"] if c in df.columns]
-        df = df[keep].drop_duplicates("item_id")
-        df = normalize_keys(df)
-        df = optimize_dtypes(df)
-        return df
-    except Exception as e:
-        print(f"Error reading Item Lookup: {e}")
-        return pd.DataFrame(columns=["item_id","client_item_nbr","brand","level_0"])
-
-@lru_cache(maxsize=1)
-def read_store_lookup_cached(file: str) -> pd.DataFrame:
-    print(f"  Loading store lookup...")
-    df = lower_cols(pd.read_csv(file, encoding="latin-1"))
-    rename_map = {}
-    if "store number" in df.columns: rename_map["store number"] = "store_id"
-    if "store name" in df.columns: rename_map["store name"] = "store_name"
-    if "estado" in df.columns: rename_map["estado"] = "state"
-    if "región" in df.columns: rename_map["región"] = "region"
-    if "regiÃ³n" in df.columns: rename_map["regiÃ³n"] = "region"
-    if "mini formato" in df.columns: rename_map["mini formato"] = "store_trait"
-    if "sel store trait" in df.columns: rename_map["sel store trait"] = "store_trait"
-    df = df.rename(columns=rename_map)
-    df = normalize_keys(df)
-    if "store_id" in df.columns:
-        df = df.drop_duplicates("store_id", keep="first")
-    df = optimize_dtypes(df)
-    return df
-
-@lru_cache(maxsize=1)
-def read_store_subcat_cached(file: str) -> pd.DataFrame:
-    print(f"  Loading store-subcategory data...")
-    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
-    if "store-subcategory id" in df.columns:
-        df[['store_id', 'subcategory']] = df['store-subcategory id'].str.extract(r'^(\d+)(.*)$')
-        df['subcategory'] = df['subcategory'].str.strip()
-        df = df.drop(columns=['store-subcategory id'])
-    rename_map = {}
-    if "pos retail" in df.columns: rename_map["pos retail"] = "units"
-    df = df.rename(columns=rename_map)
-    df = clip_nonneg(df, ["units"])
-    if not {"store_id","subcategory","units"}.issubset(df.columns):
-        raise ValueError("Store–Subcategory file missing required columns (store_id, subcategory, units).")
-    df = normalize_keys(df)
-    sub_last4 = df.groupby(["store_id","subcategory"], dropna=False, observed=True)["units"].sum().reset_index()
-    sub_last4 = optimize_dtypes(sub_last4)
-    return sub_last4
-
-@lru_cache(maxsize=1)
-def read_valid_item_trait_cached(file: str) -> pd.DataFrame:
-    print(f"  Loading valid item-trait combinations...")
-    df = lower_cols(pd.read_excel(file, engine='openpyxl'))
-    rename_map = {}
-    if "item mattel" in df.columns: rename_map["item mattel"] = "item_id"
-    if "item nbr" in df.columns: rename_map["item nbr"] = "client_item_nbr"
-    if "store trait" in df.columns: rename_map["store trait"] = "store_trait"
-    if "mini formato" in df.columns: rename_map["mini formato"] = "store_trait"
-    if "sel store trait" in df.columns: rename_map["sel store trait"] = "store_trait"
-    df = df.rename(columns=rename_map)
-    df = normalize_keys(df)
-    keep = [c for c in ["item_id","store_trait"] if c in df.columns]
-    if not set(["item_id","store_trait"]).issubset(df.columns):
-        raise ValueError("Valid Item–Store Trait file must include Item (Item Mattel) and Store Trait.")
-    df = df[keep].dropna().drop_duplicates()
-    df = optimize_dtypes(df)
-    return df
-
-############################
-# Core Computations        #
-############################
-def compute_instock_by_levels(df_current: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Compute in-stock KPIs separately for each hierarchy level"""
-    results = {}
-    
-    if df_current.empty:
-        return results
-    
-    tmp = df_current.copy()
-    tmp["in_stock_flag"] = (tmp["on_hand"] > 0).astype(np.int8)
-    
-    # Compute for each hierarchy level independently
-    for level_col, level_name in HIERARCHY_LEVELS.items():
-        if level_col in tmp.columns:
-            g = tmp.groupby(level_col, dropna=False, as_index=False, observed=True)
-            out = g.agg(
-                sites=("in_stock_flag", "count"),
-                in_stock_sites=("in_stock_flag", "sum"),
-                on_hand=("on_hand", "sum"),
-                sales_last4=("sales_last4", "sum"),
-            )
-            
-            out["instock_pct_sites"] = np.where(out["sites"]>0, out["in_stock_sites"]/out["sites"], np.nan)
-            out["instock_pct_sales_weighted"] = out["instock_pct_sites"]
-            
-            out = format_percentages(out)
-            out = round_numeric(out)
-            results[level_col] = out
-    
-    return results
-
-def compute_slow_movers_by_levels(df_current: pd.DataFrame, df_wk5: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Compute slow movers separately for each hierarchy level"""
-    results = {}
-    
-    if df_current.empty or df_wk5.empty:
-        return results
-    
-    base = safe_merge(df_current, df_wk5, on=["store_id","client_item_nbr"], how="left")
-    slow = base[(base["on_hand_wk_-5"].fillna(0) > 0) & (base["sales_last4"].fillna(0) == 0)].copy()
-    
-    if slow.empty:
-        return results
-    
-    # Aggregate by each level
-    for level_col, level_name in HIERARCHY_LEVELS.items():
-        if level_col in slow.columns:
-            slow_agg = slow.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
-                'on_hand': 'sum',
-                'sales_last4': 'sum',
-                'on_hand_wk_-5': 'sum'
-            })
-            slow_agg["slow_mover_units"] = slow_agg["on_hand"]
-            slow_agg = round_numeric(slow_agg)
-            results[level_col] = slow_agg
-    
-    return results
-
-def compute_compliance_by_levels(df_current: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Compute min/safety compliance separately for each hierarchy level"""
-    results = {}
-    
-    if df_current.empty:
-        return results
-    
-    df = df_current.copy()
-    df["mean_wk"] = df["sales_last4"].fillna(0) / 4.0
-    df["std_wk"] = np.sqrt(df["mean_wk"].clip(lower=0))
-    df["suggested_safety"] = (df["std_wk"] * 1.65 + df["mean_wk"] * 1.0).clip(lower=0)
-    
-    if "safety_stock" not in df.columns:
-        df["safety_stock"] = df["suggested_safety"]
-    if "min_stock" not in df.columns:
-        df["min_stock"] = df["mean_wk"]
-    
-    df["below_min_flag"] = (df["on_hand"] < df["min_stock"]).astype(np.int8)
-    df["below_safety_flag"] = (df["on_hand"] < df["safety_stock"]).astype(np.int8)
-    
-    # Aggregate by each level
-    for level_col, level_name in HIERARCHY_LEVELS.items():
-        if level_col in df.columns:
-            comp_agg = df.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
-                'on_hand': 'sum',
-                'min_stock': 'sum',
-                'safety_stock': 'sum',
-                'below_min_flag': 'sum',
-                'below_safety_flag': 'sum',
-                'suggested_safety': 'sum'
-            })
-            comp_agg = round_numeric(comp_agg)
-            results[level_col] = comp_agg
-    
-    return results
-
-def compute_forecast(df_current_enriched: pd.DataFrame, df_next4: pd.DataFrame,
-                     df_store_subcat: pd.DataFrame) -> pd.DataFrame:
-    """Compute forecast (store-item level for uplift calculation)"""
-    base = safe_merge(df_current_enriched, df_next4, on=["store_id","client_item_nbr"], how="left")
-    wk_lvl = base["sales_last4"].fillna(0) / 4.0
-    baseline_4w = base["n4w"].fillna(np.nan)
-    blended_4w = np.where(pd.isna(baseline_4w), wk_lvl * 4.0, 0.6 * baseline_4w + 0.4 * (wk_lvl * 4.0))
-    base["fc_final"] = pd.Series(blended_4w).clip(lower=0)
-
-    # Apply uplift
-    if not df_store_subcat.empty and ("subcategory" in base.columns):
-        sub = df_store_subcat.copy()
-        sub_chain = sub.groupby("subcategory", dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_chain")
-        sub_store = sub.groupby(["store_id","subcategory"], dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_store")
-        sub_share = safe_merge(sub_store, sub_chain, on=["subcategory"], how="left")
-        sub_share["store_sub_share"] = np.where(sub_share["sub_units_chain"]>0, sub_share["sub_units_store"]/sub_share["sub_units_chain"], np.nan)
-        sub_share["sum_share_subcat"] = sub_share.groupby("subcategory", observed=True)["store_sub_share"].transform("sum")
-        sub_share["store_sub_share_norm"] = np.where(sub_share["sum_share_subcat"]>0, sub_share["store_sub_share"]/sub_share["sum_share_subcat"], sub_share["store_sub_share"])
-        base = safe_merge(base, sub_share[["store_id","subcategory","store_sub_share_norm"]], on=["store_id","subcategory"], how="left")
-        med = sub_share.groupby("subcategory", observed=True)["store_sub_share_norm"].median().rename("median_sub_share_norm").reset_index()
-        base = safe_merge(base, med, on=["subcategory"], how="left")
-        base["uplift_factor"] = np.where(base["median_sub_share_norm"]>0, base["store_sub_share_norm"]/base["median_sub_share_norm"], 1.0)
-        if "store_trait" in base.columns:
-            base["uplift_factor"] = np.where((base["store_trait"].isin(list(SMALL_TRAITS))) | (base["store_sub_share_norm"].isna()), 1.0, base["uplift_factor"])
-        else:
-            base["uplift_factor"] = np.where((base["store_sub_share_norm"].isna()), 1.0, base["uplift_factor"])
-        base["fc_final"] = (base["fc_final"] * base["uplift_factor"]).fillna(base["fc_final"])
-
-    return base
-
-def compute_forecast_by_levels(df_fc: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Aggregate forecast by each hierarchy level"""
-    results = {}
-    
-    if df_fc.empty:
-        return results
-    
-    for level_col, level_name in HIERARCHY_LEVELS.items():
-        if level_col in df_fc.columns:
-            fc_agg = df_fc.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
-                'on_hand': 'sum',
-                'sales_last4': 'sum',
-                'fc_final': 'sum'
-            })
-            fc_agg = round_numeric(fc_agg)
-            results[level_col] = fc_agg
-    
-    return results
-
-def compute_risk_by_levels(df_fc: pd.DataFrame, lead_time_wks: int = 2, buffer_wks: float = 0.5) -> Dict[str, pd.DataFrame]:
-    """Compute stockout risk separately for each hierarchy level"""
-    results = {}
-    
-    if df_fc.empty:
-        return results
-    
-    df = df_fc.copy()
-    df["wk_demand"] = df["fc_final"] / 4.0
-    demand_horizon = (lead_time_wks + buffer_wks) * df["wk_demand"]
-    df["demand_horizon"] = demand_horizon
-    df["risk_gap"] = df["demand_horizon"] - df["on_hand"]
-    df["stockout_risk_flag"] = (df["risk_gap"] > 0).astype(np.int8)
-    df["risk_score"] = np.where(df["demand_horizon"]>0, df["risk_gap"]/df["demand_horizon"], 0)
-    
-    # Aggregate by each level
-    for level_col, level_name in HIERARCHY_LEVELS.items():
-        if level_col in df.columns:
-            risk_agg = df.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
-                'on_hand': 'sum',
-                'fc_final': 'sum',
-                'wk_demand': 'sum',
-                'demand_horizon': 'sum',
-                'risk_gap': 'sum',
-                'stockout_risk_flag': 'sum',
-                'risk_score': 'mean'
-            })
-            risk_agg = round_numeric(risk_agg)
-            results[level_col] = risk_agg
-    
-    return results
-
-def compute_distribution_by_levels(df_current: pd.DataFrame,
-                               df_store_subcat: pd.DataFrame,
-                               item_lookup: pd.DataFrame,
-                               store_lookup: pd.DataFrame,
-                               hhi_threshold: float = 0.25,
-                               share_excess_pp: float = 20.0) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
-    """Compute distribution metrics separately for each hierarchy level"""
-    hhi_results = {}
-    over_results = {}
-    
-    if df_current.empty:
-        return hhi_results, over_results
-    
-    cur = safe_merge(df_current, item_lookup, on=["client_item_nbr"], how="left")
-    cur = safe_merge(cur, store_lookup, on=["store_id"], how="left")
-    
-    # Calculate HHI at item level first
-    item_tot = cur.groupby("client_item_nbr", dropna=False, observed=True)["on_hand"].sum().reset_index(name="item_onhand_total")
-    cur = safe_merge(cur, item_tot, on=["client_item_nbr"], how="left")
-    cur["share_store_of_item"] = np.where(cur["item_onhand_total"]>0, cur["on_hand"]/cur["item_onhand_total"], 0)
-    
-    # HHI by item
-    hhi = cur.groupby("client_item_nbr", dropna=False, observed=True)["share_store_of_item"].apply(lambda s: np.sum(np.square(s))).reset_index(name="hhi")
-    hhi_flags = safe_merge(hhi, item_lookup[["client_item_nbr","item_id","brand","subcategory","year","level_0"]].drop_duplicates("client_item_nbr", keep="first"), on=["client_item_nbr"], how="left")
-    hhi_flags["hhi_flag"] = (hhi_flags["hhi"] >= hhi_threshold).astype(np.int8)
-    
-    # Aggregate HHI by each level
-    for level_col, level_name in HIERARCHY_LEVELS.items():
-        if level_col in hhi_flags.columns:
-            hhi_agg = hhi_flags.groupby(level_col, dropna=False, as_index=False, observed=True).agg({
-                'hhi': 'mean',
-                'hhi_flag': 'sum'
-            })
-            hhi_agg = round_numeric(hhi_agg)
-            hhi_results[level_col] = hhi_agg
-    
-    # Over-concentration
-    if not df_store_subcat.empty and ("subcategory" in item_lookup.columns):
-        sub = df_store_subcat.copy()
-        sub_chain = sub.groupby("subcategory", dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_chain")
-        sub_store = sub.groupby(["store_id","subcategory"], dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_store")
-        sub_share = safe_merge(sub_store, sub_chain, on=["subcategory"], how="left")
-        sub_share["store_sub_share"] = np.where(sub_share["sub_units_chain"]>0, sub_share["sub_units_store"]/sub_share["sub_units_chain"], 0)
-        sub_share["sum_share_subcat"] = sub_share.groupby("subcategory", observed=True)["store_sub_share"].transform("sum")
-        sub_share["store_sub_share_norm"] = np.where(sub_share["sum_share_subcat"]>0, sub_share["store_sub_share"]/sub_share["sum_share_subcat"], sub_share["store_sub_share"])
-
-        cur2 = safe_merge(cur, sub_share[["store_id","subcategory","store_sub_share_norm"]], on=["store_id","subcategory"], how="left")
-        cur2["share_gap_pp"] = 100.0 * (cur2["share_store_of_item"] - cur2["store_sub_share_norm"])
-        cur2["over_concentrated_flag"] = (cur2["share_gap_pp"] >= share_excess_pp).astype(np.int8)
-        
-        # Aggregate by each level
-        for level_col, level_name in HIERARCHY_LEVELS.items():
-            if level_col in cur2.columns:
-                over_agg = cur2[cur2["over_concentrated_flag"]==1].groupby(level_col, dropna=False, as_index=False, observed=True).agg({
-                    'on_hand': 'sum',
-                    'share_gap_pp': 'mean'
-                })
-                over_agg = round_numeric(over_agg)
-                over_results[level_col] = over_agg
-
-    return hhi_results, over_results
-
-def get_filter_options(dataframes: Dict) -> Dict:
-    """Get unique values for filter dropdowns"""
-    filters = {
-        "store_trait": [],
-        "state": [], 
-        "level_0": [],
-        "brand": [],
-        "item_id": []
-    }
-    
-    if "cur_enriched" in dataframes and not dataframes["cur_enriched"].empty:
-        df = dataframes["cur_enriched"]
-        if "store_trait" in df.columns:
-            filters["store_trait"] = sorted(df["store_trait"].dropna().unique().tolist())
-        if "state" in df.columns:
-            filters["state"] = sorted(df["state"].dropna().unique().tolist())
-        if "level_0" in df.columns:
-            filters["level_0"] = sorted(df["level_0"].dropna().unique().tolist())
-        if "brand" in df.columns:
-            filters["brand"] = sorted(df["brand"].dropna().unique().tolist())
-        if "item_id" in df.columns:
-            filters["item_id"] = sorted(df["item_id"].dropna().unique().tolist())
-    
-    return filters
-
-############################
-# Enhanced Chart Generation#
-############################
-def create_enhanced_charts(outputs: Dict) -> List:
-    """Create actionable CPFR charts following hierarchy"""
-    figs = []
-    
-    # Chart 1: In-Stock Performance by Store Trait & Level_0
-    fig1 = plt.figure(figsize=(14, 6))
-    
-    ax1 = plt.subplot(1, 2, 1)
-    if "instock_store_trait" in outputs and not outputs["instock_store_trait"].empty:
-        df = outputs["instock_store_trait"]
-        bars = ax1.bar(df["store_trait"].astype(str), df["instock_pct_sites"], color='steelblue')
-        ax1.set_ylabel("In-Stock % (Sites)", fontsize=11)
-        ax1.set_title("In-Stock Performance by Store Trait", fontsize=12, fontweight='bold')
-        ax1.axhline(y=90, color='red', linestyle='--', linewidth=1, label='Target 90%')
-        ax1.legend()
-        ax1.grid(axis='y', alpha=0.3)
-        for bar in bars:
-            height = bar.get_height()
-            ax1.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{height:.1f}%', ha='center', va='bottom', fontsize=9)
-    
-    ax2 = plt.subplot(1, 2, 2)
-    if "instock_level_0" in outputs and not outputs["instock_level_0"].empty:
-        df = outputs["instock_level_0"].sort_values("instock_pct_sites", ascending=False).head(10)
-        bars = ax2.barh(df["level_0"].astype(str), df["instock_pct_sites"], color='teal')
-        ax2.set_xlabel("In-Stock % (Sites)", fontsize=11)
-        ax2.set_title("Top 10 Categories - In-Stock %", fontsize=12, fontweight='bold')
-        ax2.axvline(x=90, color='red', linestyle='--', linewidth=1, label='Target 90%')
-        ax2.legend()
-        ax2.invert_yaxis()
-        ax2.grid(axis='x', alpha=0.3)
-    
-    plt.tight_layout()
-    figs.append(fig1)
-    
-    # Chart 2: Inventory Alerts Dashboard
-    fig2 = plt.figure(figsize=(14, 10))
-    
-    ax1 = plt.subplot(2, 2, 1)
-    if "slow_level_0" in outputs and not outputs["slow_level_0"].empty:
-        df = outputs["slow_level_0"].sort_values("slow_mover_units", ascending=False).head(10)
-        ax1.barh(df["level_0"].astype(str), df["slow_mover_units"], color='darkred')
-        ax1.set_xlabel("Units (Slow Movers)", fontsize=10)
-        ax1.set_title("Top 10 Categories - Slow Moving Inventory", fontsize=11, fontweight='bold')
-        ax1.invert_yaxis()
-        ax1.grid(axis='x', alpha=0.3)
-    
-    ax2 = plt.subplot(2, 2, 2)
-    if "compliance_brand" in outputs and not outputs["compliance_brand"].empty:
-        df = outputs["compliance_brand"].sort_values("below_min_flag", ascending=False).head(10)
-        ax2.barh(df["brand"].astype(str), df["below_min_flag"], color='orange')
-        ax2.set_xlabel("Sites Below Minimum", fontsize=10)
-        ax2.set_title("Top 10 Brands - Below Min Stock", fontsize=11, fontweight='bold')
-        ax2.invert_yaxis()
-        ax2.grid(axis='x', alpha=0.3)
-    
-    ax3 = plt.subplot(2, 2, 3)
-    if "compliance_level_0" in outputs and not outputs["compliance_level_0"].empty:
-        df = outputs["compliance_level_0"].sort_values("below_safety_flag", ascending=False).head(10)
-        ax3.barh(df["level_0"].astype(str), df["below_safety_flag"], color='tomato')
-        ax3.set_xlabel("Sites Below Safety", fontsize=10)
-        ax3.set_title("Top 10 Categories - Below Safety Stock", fontsize=11, fontweight='bold')
-        ax3.invert_yaxis()
-        ax3.grid(axis='x', alpha=0.3)
-    
-    ax4 = plt.subplot(2, 2, 4)
-    if "compliance_state" in outputs and not outputs["compliance_state"].empty:
-        df = outputs["compliance_state"].sort_values("below_safety_flag", ascending=False).head(10)
-        x = np.arange(len(df))
-        width = 0.35
-        ax4.barh(x - width/2, df["below_min_flag"], width, label='Below Min', color='orange')
-        ax4.barh(x + width/2, df["below_safety_flag"], width, label='Below Safety', color='tomato')
-        ax4.set_yticks(x)
-        ax4.set_yticklabels(df["state"].astype(str))
-        ax4.set_xlabel("Number of Alerts", fontsize=10)
-        ax4.set_title("Top 10 States - Inventory Alerts", fontsize=11, fontweight='bold')
-        ax4.legend()
-        ax4.invert_yaxis()
-        ax4.grid(axis='x', alpha=0.3)
-    
-    plt.tight_layout()
-    figs.append(fig2)
-    
-    # Chart 3: Stockout Risk Analysis
-    fig3 = plt.figure(figsize=(14, 10))
-    
-    ax1 = plt.subplot(2, 2, 1)
-    if "risk_level_0" in outputs and not outputs["risk_level_0"].empty:
-        df = outputs["risk_level_0"].sort_values("risk_score", ascending=False).head(15)
-        bars = ax1.bar(df["level_0"].astype(str), df["risk_score"], color='crimson')
-        ax1.set_ylabel("Average Risk Score", fontsize=10)
-        ax1.set_title("Stockout Risk by Category (Top 15)", fontsize=11, fontweight='bold')
-        ax1.tick_params(axis='x', rotation=45, labelsize=8)
-        ax1.axhline(y=0.5, color='orange', linestyle='--', linewidth=1, label='High Risk Threshold')
-        ax1.legend()
-        ax1.grid(axis='y', alpha=0.3)
-    
-    ax2 = plt.subplot(2, 2, 2)
-    if "risk_brand" in outputs and not outputs["risk_brand"].empty:
-        df = outputs["risk_brand"].sort_values("stockout_risk_flag", ascending=False).head(10)
-        ax2.barh(df["brand"].astype(str), df["stockout_risk_flag"], color='darkred')
-        ax2.set_xlabel("At-Risk Sites", fontsize=10)
-        ax2.set_title("Top 10 Brands - Stockout Risk Alerts", fontsize=11, fontweight='bold')
-        ax2.invert_yaxis()
-        ax2.grid(axis='x', alpha=0.3)
-    
-    ax3 = plt.subplot(2, 2, 3)
-    if "risk_store_trait" in outputs and not outputs["risk_store_trait"].empty:
-        df = outputs["risk_store_trait"]
-        x = np.arange(len(df))
-        width = 0.35
-        ax3.bar(x - width/2, df["risk_gap"], width, label='Risk Gap', color='red', alpha=0.7)
-        ax3.bar(x + width/2, df["on_hand"], width, label='On Hand', color='green', alpha=0.7)
-        ax3.set_xticks(x)
-        ax3.set_xticklabels(df["store_trait"].astype(str))
-        ax3.set_ylabel("Units", fontsize=10)
-        ax3.set_title("Inventory Position by Store Trait", fontsize=11, fontweight='bold')
-        ax3.legend()
-        ax3.grid(axis='y', alpha=0.3)
-    
-    ax4 = plt.subplot(2, 2, 4)
-    if "risk_state" in outputs and not outputs["risk_state"].empty:
-        df = outputs["risk_state"].copy()
-        df['coverage_ratio'] = df['on_hand'] / df['demand_horizon'].replace(0, 1)
-        df = df.sort_values("coverage_ratio", ascending=True).head(10)
-        colors = ['red' if x < 1 else 'green' for x in df['coverage_ratio']]
-        ax4.barh(df["state"].astype(str), df["coverage_ratio"], color=colors)
-        ax4.axvline(x=1.0, color='black', linestyle='--', linewidth=1, label='100% Coverage')
-        ax4.set_xlabel("Coverage Ratio (On Hand / Demand)", fontsize=10)
-        ax4.set_title("Bottom 10 States - Inventory Coverage", fontsize=11, fontweight='bold')
-        ax4.invert_yaxis()
-        ax4.legend()
-        ax4.grid(axis='x', alpha=0.3)
-    
-    plt.tight_layout()
-    figs.append(fig3)
-    
-    # Chart 4: Distribution & Concentration Analysis
-    fig4 = plt.figure(figsize=(14, 10))
-    
-    ax1 = plt.subplot(2, 2, 1)
-    if "hhi_level_0" in outputs and not outputs["hhi_level_0"].empty:
-        df = outputs["hhi_level_0"].sort_values("hhi", ascending=False).head(15)
-        bars = ax1.bar(df["level_0"].astype(str), df["hhi"], color='purple')
-        ax1.set_ylabel("Average HHI", fontsize=10)
-        ax1.set_title("Inventory Concentration by Category (Top 15)", fontsize=11, fontweight='bold')
-        ax1.tick_params(axis='x', rotation=45, labelsize=8)
-        ax1.axhline(y=0.25, color='red', linestyle='--', linewidth=1, label='High Concentration Threshold')
-        ax1.legend()
-        ax1.grid(axis='y', alpha=0.3)
-    
-    ax2 = plt.subplot(2, 2, 2)
-    if "hhi_brand" in outputs and not outputs["hhi_brand"].empty:
-        df = outputs["hhi_brand"].sort_values("hhi_flag", ascending=False).head(10)
-        ax2.barh(df["brand"].astype(str), df["hhi_flag"], color='indigo')
-        ax2.set_xlabel("High Concentration Items", fontsize=10)
-        ax2.set_title("Top 10 Brands - Concentration Alerts", fontsize=11, fontweight='bold')
-        ax2.invert_yaxis()
-        ax2.grid(axis='x', alpha=0.3)
-    
-    ax3 = plt.subplot(2, 2, 3)
-    if "over_level_0" in outputs and not outputs["over_level_0"].empty:
-        df = outputs["over_level_0"].sort_values("on_hand", ascending=False).head(10)
-        ax3.barh(df["level_0"].astype(str), df["on_hand"], color='maroon')
-        ax3.set_xlabel("Over-Concentrated Units", fontsize=10)
-        ax3.set_title("Top 10 Categories - Over-Concentration", fontsize=11, fontweight='bold')
-        ax3.invert_yaxis()
-        ax3.grid(axis='x', alpha=0.3)
-    
-    ax4 = plt.subplot(2, 2, 4)
-    if "over_brand" in outputs and not outputs["over_brand"].empty:
-        df = outputs["over_brand"].sort_values("share_gap_pp", ascending=False).head(10)
-        ax4.barh(df["brand"].astype(str), df["share_gap_pp"], color='darkviolet')
-        ax4.axvline(x=20, color='red', linestyle='--', linewidth=2, label='Alert Threshold (20pp)')
-        ax4.set_xlabel("Average Share Gap (pp)", fontsize=10)
-        ax4.set_title("Top 10 Brands - Share Gap", fontsize=11, fontweight='bold')
-        ax4.invert_yaxis()
-        ax4.legend()
-        ax4.grid(axis='x', alpha=0.3)
-    
-    plt.tight_layout()
-    figs.append(fig4)
-    
-    return figs
-
-############################
-# Optimized Engine         #
-############################
-def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = False):
-    """Optimized engine with separate hierarchy level aggregations"""
-    import time
-    start_time = time.time()
-    
-    if filters is None:
-        filters = {}
-    
-    required = ["file_current","file_wk5","file_next4","file_item_lookup","file_store_lookup"]
-    for k in required:
-        if not cfg.get(k) or not os.path.exists(cfg[k]):
-            raise FileNotFoundError(f"Path not found or missing in config: {k} -> {cfg.get(k)}")
-
-    print("\n=== CPFR Analysis Started ===")
-    print("Step 1/5: Loading data files...")
-    
-    # Use cached readers
-    df_current = read_current_cached(cfg["file_current"])
-    df_wk5 = read_wk5_cached(cfg["file_wk5"])
-    df_next4 = read_next4_cached(cfg["file_next4"])
-    
-    df_store_subcat = pd.DataFrame()
-    if cfg.get("file_store_subcat") and os.path.exists(cfg["file_store_subcat"]):
-        df_store_subcat = read_store_subcat_cached(cfg["file_store_subcat"])
-    
-    item_lookup = read_item_lookup_cached(cfg["file_item_lookup"])
-    store_lookup = read_store_lookup_cached(cfg["file_store_lookup"])
-    
-    print(f"  Loaded {len(df_current):,} current inventory records")
-    print(f"  Loaded {len(item_lookup):,} items and {len(store_lookup):,} stores")
-
-    print("\nStep 2/5: Enriching data with hierarchy...")
-    cur_enriched = safe_merge(df_current, item_lookup, on=["client_item_nbr"], how="left")
-    cur_enriched = safe_merge(cur_enriched, store_lookup, on=["store_id"], how="left")
-    cur_enriched = normalize_keys(cur_enriched)
-    cur_enriched = optimize_dtypes(cur_enriched)
-
-    # Apply valid item-trait filter if provided
-    valid_path = cfg.get("file_valid_item_trait", "")
-    if valid_path and os.path.exists(valid_path):
-        valid = read_valid_item_trait_cached(valid_path)
-        before = len(cur_enriched)
-        cur_enriched = safe_merge(cur_enriched, valid, on=["item_id","store_trait"], how="inner")
-        after = len(cur_enriched)
-        allowed_keys = cur_enriched[["store_id","client_item_nbr"]].drop_duplicates()
-        df_current = safe_merge(df_current, allowed_keys, on=["store_id","client_item_nbr"], how="inner")
-        print(f"  Applied Valid Item–Trait filter: kept {after:,} of {before:,} records ({100*after/before:.1f}%)")
-
-    # Apply hierarchy filters
-    if any(filters.values()):
-        print("  Applying hierarchy filters...")
-        before = len(cur_enriched)
-        cur_enriched = apply_hierarchy_filters(cur_enriched, filters)
-        df_current = apply_hierarchy_filters(df_current, filters)
-        after = len(cur_enriched)
-        print(f"  Filtered to {after:,} records ({100*after/before:.1f}% of previous)")
-
-    # Store dataframes for filter options
-    dataframes = {"cur_enriched": cur_enriched}
-
-    print("\nStep 3/5: Computing KPIs by hierarchy levels...")
-    
-    # In-stock analysis - separate for each level
-    print("  - In-stock metrics (by Store Trait, State, Level_0, Brand, Item)")
-    instock_by_levels = compute_instock_by_levels(cur_enriched)
-    
-    # Inventory alerts
-    print("  - Slow movers (by hierarchy levels)")
-    slow_by_levels = compute_slow_movers_by_levels(cur_enriched, df_wk5)
-    
-    print("  - Min/Safety compliance (by hierarchy levels)")
-    compliance_by_levels = compute_compliance_by_levels(cur_enriched)
-
-    # Forecast & Risk
-    print("  - Forecast with uplift")
-    df_fc = compute_forecast(cur_enriched, df_next4, df_store_subcat)
-    
-    print("  - Forecast aggregation (by hierarchy levels)")
-    forecast_by_levels = compute_forecast_by_levels(df_fc)
-    
-    print("  - Stockout risk analysis (by hierarchy levels)")
-    risk_by_levels = compute_risk_by_levels(df_fc, 
-                                  lead_time_wks=int(cfg.get("lead_time_wks",2)), 
-                                  buffer_wks=float(cfg.get("buffer_wks",0.5)))
-
-    # Distribution
-    print("  - Distribution concentration (by hierarchy levels)")
-    hhi_by_levels, over_by_levels = compute_distribution_by_levels(df_current, df_store_subcat, item_lookup, store_lookup,
-                                                       hhi_threshold=float(cfg.get("hhi_threshold",0.25)),
-                                                       share_excess_pp=float(cfg.get("share_excess_pp",20.0)))
-
-    print("\nStep 4/5: Preparing outputs...")
-    
-    # Prepare output dictionary with all hierarchy levels
-    outputs = {}
-    
-    # In-stock
-    for level_col, df in instock_by_levels.items():
-        outputs[f"instock_{level_col}"] = df
-    
-    # Slow movers
-    for level_col, df in slow_by_levels.items():
-        outputs[f"slow_{level_col}"] = df
-    
-    # Compliance
-    for level_col, df in compliance_by_levels.items():
-        outputs[f"compliance_{level_col}"] = df
-    
-    # Forecast
-    for level_col, df in forecast_by_levels.items():
-        outputs[f"forecast_{level_col}"] = df
-    
-    # Risk
-    for level_col, df in risk_by_levels.items():
-        outputs[f"risk_{level_col}"] = df
-    
-    # HHI
-    for level_col, df in hhi_by_levels.items():
-        outputs[f"hhi_{level_col}"] = df
-    
-    # Over-concentration
-    for level_col, df in over_by_levels.items():
-        outputs[f"over_{level_col}"] = df
-    
-    # Export to CSV
-    print("  - Exporting CSV files...")
-    paths = []
-    
-    for key, df in outputs.items():
-        if not df.empty:
-            fname = f"{key}.csv"
-            path = os.path.join(EXPORT_DIR, fname)
-            df.to_csv(path, index=False, encoding="utf-8-sig")
-            paths.append(path)
-    
-    print(f"    ✓ Exported {len(paths)} CSV files")
-    
-    # Optional: Export store-item detail if requested
-    if show_store_item:
-        print("  - Exporting store-item detail (this may take longer)...")
-        detail_cols = ["store_id", "client_item_nbr", "item_id", "brand", "level_0", "store_name", 
-                      "state", "store_trait", "on_hand", "sales_last4"]
-        available_cols = [c for c in detail_cols if c in cur_enriched.columns]
-        store_item_detail = cur_enriched[available_cols].copy()
-        detail_path = os.path.join(EXPORT_DIR, "store_item_detail.csv")
-        store_item_detail.to_csv(detail_path, index=False, encoding="utf-8-sig")
-        paths.append(detail_path)
-        print(f"    ✓ store_item_detail.csv ({len(store_item_detail):,} rows)")
-
-    print("\nStep 5/5: Generating charts...")
-    figs = create_enhanced_charts(outputs)
-    print(f"  ✓ Generated {len(figs)} chart panels")
-
-    elapsed = time.time() - start_time
-    print(f"\n=== Analysis Complete in {elapsed:.1f} seconds ===\n")
-
-    return outputs, paths, figs, dataframes
-
-############################
-# Gradio UI                #
-############################
-def launch_gradio():
-    try:
-        import gradio as gr
+        return template.format(**context)
     except Exception:
-        print("Install Gradio: pip install gradio")
-        raise
+        return template
 
-    cfg = load_config("cpfr_config.json")
+########################
+# DATA LOADERS         #
+########################
 
-    with gr.Blocks(title=APP_TITLE, theme=gr.themes.Soft()) as demo:
-        gr.Markdown(f"# {APP_TITLE}\n**Optimized with separate hierarchy level aggregations and actionable CPFR charts.**")
-        
-        # Store filter state
-        dataframes_state = gr.State({})
+@lru_cache(maxsize=1)
+def read_dim_item(file: str) -> pd.DataFrame:
+    """DIM_ITEM: Item Catalog (grain: client_item_nbr)"""
+    print("  Loading DIM_ITEM (item catalog)...")
+    df = lower_cols(pd.read_excel(file, engine="openpyxl"))
 
-        # File paths
-        with gr.Row():
-            file_current_p = gr.Textbox(value=cfg.get("file_current",""), label="Path: Current Inventory + L4W (.xlsx)")
-            file_wk5_p = gr.Textbox(value=cfg.get("file_wk5",""), label="Path: Inventory 5 Weeks Ago (.xlsx)")
-            file_next4_p = gr.Textbox(value=cfg.get("file_next4",""), label="Path: Sell-Out N4W (.xlsx)")
-        with gr.Row():
-            file_store_subcat_p = gr.Textbox(value=cfg.get("file_store_subcat",""), label="Path: Subcategory-Store Sell-Out (.xlsx, optional)")
-            file_item_lookup_p = gr.Textbox(value=cfg.get("file_item_lookup",""), label="Path: Item Lookup (.csv)")
-            file_store_lookup_p = gr.Textbox(value=cfg.get("file_store_lookup",""), label="Path: Store Lookup (.csv)")
-        with gr.Row():
-            file_valid_item_trait_p = gr.Textbox(value=cfg.get("file_valid_item_trait",""), label="Path: Valid (Item, Store Trait) combinations (.xlsx, optional)")
-        
-        # Hierarchy Filters
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown("### 🔍 Hierarchy Filters")
-                with gr.Row():
-                    store_trait_filter = gr.Dropdown(label="Store Trait", choices=[], multiselect=True, interactive=True)
-                    state_filter = gr.Dropdown(label="State", choices=[], multiselect=True, interactive=True)
-                with gr.Row():
-                    level0_filter = gr.Dropdown(label="Level_0", choices=[], multiselect=True, interactive=True)
-                    brand_filter = gr.Dropdown(label="Brand", choices=[], multiselect=True, interactive=True)
-                with gr.Row():
-                    item_filter = gr.Dropdown(label="Item Mattel", choices=[], multiselect=True, interactive=True)
-                    show_store_item_check = gr.Checkbox(label="Export Store-Item Detail (slower)", value=False, info="Enable to get granular store-item level data")
-        
-        # Parameters
-        with gr.Row():
-            lead_p = gr.Slider(1, 4, value=cfg.get("lead_time_wks",2), step=1, label="Lead Time (weeks)")
-            buffer_p = gr.Slider(0.0, 2.0, value=cfg.get("buffer_wks",0.5), step=0.1, label="Buffer Coverage (weeks)")
-        with gr.Row():
-            hhi_thr_p = gr.Slider(0.05, 1.00, value=cfg.get("hhi_threshold",0.25), step=0.01, label="HHI Flag Threshold (0–1)")
-            share_pp_p = gr.Slider(1.0, 100.0, value=cfg.get("share_excess_pp",20.0), step=1.0, label="Over-Concentration Threshold (pp)")
+    rename_map = {
+        "item nbr": "client_item_nbr",
+        "item desc": "item_desc",
+        "item description": "item_desc",
+        "subcategory": "subcategory",
+        "category": "category",
+        "brand": "brand",
+        "units per case": "units_per_case",
+        "item status": "item_status",
+        "launch date": "launch_date",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-        # Action buttons
-        with gr.Row():
-            save_btn = gr.Button("💾 Save Config", variant="secondary")
-            run_btn = gr.Button("🚀 Run Analysis", variant="primary", size="lg")
-        
-        save_status = gr.Textbox(label="Config Save Status", value="")
+    if "client_item_nbr" not in df.columns:
+        raise ValueError("DIM_ITEM must have 'client_item_nbr' column")
 
-        # Results tabs - ORGANIZED BY HIERARCHY LEVEL
-        with gr.Tab("📊 In-Stock Analysis"):
-            gr.Markdown("**Results by each hierarchy level independently**")
-            with gr.Accordion("By Store Trait", open=True):
-                t_instock_trait = gr.Dataframe(label="In-Stock by Store Trait", wrap=True)
-            with gr.Accordion("By State", open=False):
-                t_instock_state = gr.Dataframe(label="In-Stock by State", wrap=True)
-            with gr.Accordion("By Level_0", open=False):
-                t_instock_level0 = gr.Dataframe(label="In-Stock by Level_0", wrap=True)
-            with gr.Accordion("By Brand", open=False):
-                t_instock_brand = gr.Dataframe(label="In-Stock by Brand", wrap=True)
-            with gr.Accordion("By Item Mattel", open=False):
-                t_instock_item = gr.Dataframe(label="In-Stock by Item Mattel", wrap=True)
-        
-        with gr.Tab("🚨 Inventory Alerts"):
-            gr.Markdown("**Slow movers and compliance issues by hierarchy level**")
-            with gr.Accordion("Slow Movers - By Store Trait", open=True):
-                t_slow_trait = gr.Dataframe(label="Slow Movers by Store Trait", wrap=True)
-            with gr.Accordion("Slow Movers - By State", open=False):
-                t_slow_state = gr.Dataframe(label="Slow Movers by State", wrap=True)
-            with gr.Accordion("Slow Movers - By Level_0", open=False):
-                t_slow_level0 = gr.Dataframe(label="Slow Movers by Level_0", wrap=True)
-            with gr.Accordion("Slow Movers - By Brand", open=False):
-                t_slow_brand = gr.Dataframe(label="Slow Movers by Brand", wrap=True)
-            
-            gr.Markdown("---")
-            
-            with gr.Accordion("Min/Safety Compliance - By Store Trait", open=True):
-                t_comp_trait = gr.Dataframe(label="Compliance by Store Trait", wrap=True)
-            with gr.Accordion("Min/Safety Compliance - By State", open=False):
-                t_comp_state = gr.Dataframe(label="Compliance by State", wrap=True)
-            with gr.Accordion("Min/Safety Compliance - By Level_0", open=False):
-                t_comp_level0 = gr.Dataframe(label="Compliance by Level_0", wrap=True)
-            with gr.Accordion("Min/Safety Compliance - By Brand", open=False):
-                t_comp_brand = gr.Dataframe(label="Compliance by Brand", wrap=True)
-        
-        with gr.Tab("📈 Forecast & Risk"):
-            gr.Markdown("**Forecast and stockout risk by hierarchy level**")
-            with gr.Accordion("Forecast - By Store Trait", open=True):
-                t_fc_trait = gr.Dataframe(label="Forecast by Store Trait", wrap=True)
-            with gr.Accordion("Forecast - By State", open=False):
-                t_fc_state = gr.Dataframe(label="Forecast by State", wrap=True)
-            with gr.Accordion("Forecast - By Level_0", open=False):
-                t_fc_level0 = gr.Dataframe(label="Forecast by Level_0", wrap=True)
-            with gr.Accordion("Forecast - By Brand", open=False):
-                t_fc_brand = gr.Dataframe(label="Forecast by Brand", wrap=True)
-            
-            gr.Markdown("---")
-            
-            with gr.Accordion("Stockout Risk - By Store Trait", open=True):
-                t_risk_trait = gr.Dataframe(label="Risk by Store Trait", wrap=True)
-            with gr.Accordion("Stockout Risk - By State", open=False):
-                t_risk_state = gr.Dataframe(label="Risk by State", wrap=True)
-            with gr.Accordion("Stockout Risk - By Level_0", open=False):
-                t_risk_level0 = gr.Dataframe(label="Risk by Level_0", wrap=True)
-            with gr.Accordion("Stockout Risk - By Brand", open=False):
-                t_risk_brand = gr.Dataframe(label="Risk by Brand", wrap=True)
-        
-        with gr.Tab("🎯 Distribution Insights"):
-            gr.Markdown("**Distribution concentration metrics by hierarchy level**")
-            with gr.Accordion("HHI Concentration - By Store Trait", open=True):
-                t_hhi_trait = gr.Dataframe(label="HHI by Store Trait", wrap=True)
-            with gr.Accordion("HHI Concentration - By State", open=False):
-                t_hhi_state = gr.Dataframe(label="HHI by State", wrap=True)
-            with gr.Accordion("HHI Concentration - By Level_0", open=False):
-                t_hhi_level0 = gr.Dataframe(label="HHI by Level_0", wrap=True)
-            with gr.Accordion("HHI Concentration - By Brand", open=False):
-                t_hhi_brand = gr.Dataframe(label="HHI by Brand", wrap=True)
-            
-            gr.Markdown("---")
-            
-            with gr.Accordion("Over-Concentration - By Store Trait", open=True):
-                t_over_trait = gr.Dataframe(label="Over-Concentration by Store Trait", wrap=True)
-            with gr.Accordion("Over-Concentration - By State", open=False):
-                t_over_state = gr.Dataframe(label="Over-Concentration by State", wrap=True)
-            with gr.Accordion("Over-Concentration - By Level_0", open=False):
-                t_over_level0 = gr.Dataframe(label="Over-Concentration by Level_0", wrap=True)
-            with gr.Accordion("Over-Concentration - By Brand", open=False):
-                t_over_brand = gr.Dataframe(label="Over-Concentration by Brand", wrap=True)
-        
-        with gr.Tab("📉 CPFR Charts"):
-            gr.Markdown("### Actionable CPFR Visual Analytics")
-            gr.Markdown("**Chart 1: In-Stock Performance Analysis**")
-            p1 = gr.Plot(label="In-Stock by Store Trait & Top Categories")
-            gr.Markdown("**Chart 2: Inventory Alerts Dashboard**")
-            p2 = gr.Plot(label="Slow Movers, Below Min/Safety Alerts")
-            gr.Markdown("**Chart 3: Stockout Risk Analysis**")
-            p3 = gr.Plot(label="Risk Scores, Coverage Ratios, At-Risk Sites")
-            gr.Markdown("**Chart 4: Distribution & Concentration**")
-            p4 = gr.Plot(label="HHI Concentration, Over-Concentration Analysis")
-        
-        with gr.Tab("📥 Downloads"):
-            files = gr.Files(label="CSV Outputs")
-            gr.Markdown("*All files contain hierarchy-level aggregated data*")
+    df = normalize_keys(df)
+    df = df.drop_duplicates(subset=["client_item_nbr"])
+    df = optimize_dtypes(df)
 
-        # Save config function
-        def save_cfg(file_current, file_wk5, file_next4, file_store_subcat, file_item_lookup, file_store_lookup, file_valid_item_trait, lead, buffer, hhi_thr, share_pp):
-            cfg_upd = {
-                "file_current": file_current, "file_wk5": file_wk5, "file_next4": file_next4,
-                "file_store_subcat": file_store_subcat, "file_item_lookup": file_item_lookup, "file_store_lookup": file_store_lookup,
-                "file_valid_item_trait": file_valid_item_trait,
-                "lead_time_wks": lead, "buffer_wks": buffer, "hhi_threshold": hhi_thr, "share_excess_pp": share_pp
-            }
-            save_config("cpfr_config.json", cfg_upd)
-            return gr.update(value="✅ Config saved to cpfr_config.json")
+    print(f"    ✓ {len(df):,} items loaded")
+    return df
 
-        # Update filters function
-        def update_filters(dataframes):
-            filter_options = get_filter_options(dataframes)
-            return (
-                gr.update(choices=filter_options["store_trait"]),
-                gr.update(choices=filter_options["state"]),
-                gr.update(choices=filter_options["level_0"]),
-                gr.update(choices=filter_options["brand"]),
-                gr.update(choices=filter_options["item_id"])
-            )
+@lru_cache(maxsize=1)
+def read_dim_store(file: str) -> pd.DataFrame:
+    """DIM_STORE: Store Catalog (grain: store_id)"""
+    print("  Loading DIM_STORE (store catalog)...")
+    df = lower_cols(pd.read_excel(file, engine="openpyxl"))
 
-        # Run analysis function
-        def _run(file_current, file_wk5, file_next4, file_store_subcat, file_item_lookup, file_store_lookup, 
-                file_valid_item_trait, lead, buffer, hhi_thr, share_pp, store_trait, state, level0, brand, item, show_detail):
-            
-            # Prepare filters
-            filters = {
-                "store_trait": store_trait if store_trait else [],
-                "state": state if state else [],
-                "level_0": level0 if level0 else [],
-                "brand": brand if brand else [],
-                "item_id": item if item else []
-            }
-            
-            cfg = {
-                "file_current": file_current, "file_wk5": file_wk5, "file_next4": file_next4,
-                "file_store_subcat": file_store_subcat, "file_item_lookup": file_item_lookup, "file_store_lookup": file_store_lookup,
-                "file_valid_item_trait": file_valid_item_trait,
-                "lead_time_wks": lead, "buffer_wks": buffer, "hhi_threshold": hhi_thr, "share_excess_pp": share_pp
-            }
-            
-            try:
-                outputs, paths, figs, dataframes = run_engine_paths(cfg, filters, show_store_item=show_detail)
-                
-                # Update filter options
-                filter_updates = update_filters(dataframes)
-                
-                # Helper to get dataframe or empty
-                def get_df(key):
-                    return outputs.get(key, pd.DataFrame())
-                
-                return (
-                    # In-stock
-                    get_df("instock_store_trait"),
-                    get_df("instock_state"),
-                    get_df("instock_level_0"),
-                    get_df("instock_brand"),
-                    get_df("instock_item_id"),
-                    # Slow movers
-                    get_df("slow_store_trait"),
-                    get_df("slow_state"),
-                    get_df("slow_level_0"),
-                    get_df("slow_brand"),
-                    # Compliance
-                    get_df("compliance_store_trait"),
-                    get_df("compliance_state"),
-                    get_df("compliance_level_0"),
-                    get_df("compliance_brand"),
-                    # Forecast
-                    get_df("forecast_store_trait"),
-                    get_df("forecast_state"),
-                    get_df("forecast_level_0"),
-                    get_df("forecast_brand"),
-                    # Risk
-                    get_df("risk_store_trait"),
-                    get_df("risk_state"),
-                    get_df("risk_level_0"),
-                    get_df("risk_brand"),
-                    # HHI
-                    get_df("hhi_store_trait"),
-                    get_df("hhi_state"),
-                    get_df("hhi_level_0"),
-                    get_df("hhi_brand"),
-                    # Over-concentration
-                    get_df("over_store_trait"),
-                    get_df("over_state"),
-                    get_df("over_level_0"),
-                    get_df("over_brand"),
-                    # Charts
-                    figs[0] if len(figs) > 0 else None,
-                    figs[1] if len(figs) > 1 else None,
-                    figs[2] if len(figs) > 2 else None,
-                    figs[3] if len(figs) > 3 else None,
-                    # Files
-                    paths,
-                    # Filter updates
-                    *filter_updates,
-                    # Dataframes state
-                    dataframes
-                )
-            except Exception as e:
-                import traceback
-                error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
-                print(error_msg)
-                empty_df = pd.DataFrame()
-                return tuple([empty_df] * 28 + [None, None, None, None, []] + [gr.update()] * 5 + [{}])
+    rename_map = {
+        "store nbr": "store_id",
+        "store name": "store_name",
+        "state": "state",
+        "region": "region",
+        "tier": "store_tier",
+        "store tier": "store_tier",
+        "format": "store_format",
+        "store format": "store_format",
+        "cluster": "cluster",
+        "store size": "store_size",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-        # Connect buttons
-        save_btn.click(
-            save_cfg,
-            inputs=[file_current_p, file_wk5_p, file_next4_p, file_store_subcat_p, file_item_lookup_p, 
-                   file_store_lookup_p, file_valid_item_trait_p, lead_p, buffer_p, hhi_thr_p, share_pp_p],
-            outputs=[save_status]
+    if "store_id" not in df.columns:
+        raise ValueError("DIM_STORE must have 'store_id' column")
+
+    df = normalize_keys(df)
+    df = df.drop_duplicates(subset=["store_id"])
+    df = optimize_dtypes(df)
+
+    print(f"    ✓ {len(df):,} stores loaded")
+    return df
+
+@lru_cache(maxsize=1)
+def read_f_store_item_ly(file: str) -> pd.DataFrame:
+    """
+    F_STORE_ITEM_LY: Multi-week Last Year Sell-Out
+    Grain: store_id × client_item_nbr × week_id
+    NOTE (V3): No filtering happens here. YoY comparator + history windows are derived later.
+    """
+    print("  Loading F_STORE_ITEM_LY (LY sell-out, multi-week)...")
+    df = lower_cols(pd.read_excel(file, engine="openpyxl"))
+
+    rename_map = {
+        "store nbr": "store_id",
+        "item nbr": "client_item_nbr",
+        "week": "week_id",
+        "week_id": "week_id",
+        "pos qty": "sellout_units_ly",
+        "sellout": "sellout_units_ly",
+        "sales qty": "sellout_units_ly",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    required = ["store_id", "client_item_nbr", "week_id", "sellout_units_ly"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"F_STORE_ITEM_LY missing required columns: {missing}")
+
+    df = clip_nonneg(df, ["sellout_units_ly"])
+    df = normalize_keys(df)
+
+    df = dedup_sum(df, keys=["store_id", "client_item_nbr", "week_id"], sum_cols=["sellout_units_ly"])
+    df = optimize_dtypes(df)
+
+    print(f"    ✓ {len(df):,} store-item-week rows loaded ({df['week_id'].nunique():,} unique weeks)")
+    return df
+
+@lru_cache(maxsize=1)
+def read_f_store_item_current(file: str, week_id: str = "", as_of_date: str = "") -> pd.DataFrame:
+    """F_STORE_ITEM_CURRENT: Current Snapshot (grain: store_id × client_item_nbr)"""
+    print("  Loading F_STORE_ITEM_CURRENT (current snapshot)...")
+    df = lower_cols(pd.read_excel(file, engine="openpyxl"))
+
+    rename_map = {
+        "store nbr": "store_id",
+        "item nbr": "client_item_nbr",
+        "pos qty": "sellout_units_lw",
+        "sellout": "sellout_units_lw",
+        "last week sellout": "sellout_units_lw",
+        "total inv": "on_hand_units",
+        "on hand": "on_hand_units",
+        "inventory": "on_hand_units",
+        "on order": "on_order_units",
+        "week": "week_id",
+        "as of date": "as_of_date",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    required = ["store_id", "client_item_nbr", "sellout_units_lw", "on_hand_units"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"F_STORE_ITEM_CURRENT missing required columns: {missing}")
+
+    df = clip_nonneg(df, ["sellout_units_lw", "on_hand_units", "on_order_units"])
+    df = normalize_keys(df)
+
+    # Store-item snapshot => sum duplicated combinations (common in exports)
+    df = dedup_sum(df, keys=["store_id", "client_item_nbr"], sum_cols=["sellout_units_lw", "on_hand_units", "on_order_units"])
+
+    # Add time dimension if not present
+    if "week_id" not in df.columns and week_id:
+        df["week_id"] = str(week_id)
+    if "as_of_date" not in df.columns and as_of_date:
+        df["as_of_date"] = str(as_of_date)
+
+    df = optimize_dtypes(df)
+
+    print(f"    ✓ {len(df):,} store-item combinations loaded")
+    return df
+
+@lru_cache(maxsize=1)
+def read_f_store_subcategory_season(file: str) -> pd.DataFrame:
+    """F_STORE_SUBCATEGORY_SEASON: Seasonal Store-Subcategory Demand"""
+    print("  Loading F_STORE_SUBCATEGORY_SEASON (seasonal demand)...")
+    df = lower_cols(pd.read_excel(file, engine="openpyxl"))
+
+    rename_map = {
+        "store nbr": "store_id",
+        "subcategory": "subcategory",
+        "season": "season",
+        "week": "week_id",
+        "week_id": "week_id",
+        "seasonal sellout": "seasonal_sellout_units",
+        "sellout": "seasonal_sellout_units",
+        "demand": "seasonal_sellout_units",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    required = ["store_id", "subcategory", "seasonal_sellout_units"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"F_STORE_SUBCATEGORY_SEASON missing required columns: {missing}")
+
+    df = clip_nonneg(df, ["seasonal_sellout_units"])
+    df = normalize_keys(df)
+
+    # Determine grain (season or week_id)
+    if "season" in df.columns and "week_id" in df.columns:
+        keys = ["store_id", "subcategory", "season", "week_id"]
+    elif "season" in df.columns:
+        keys = ["store_id", "subcategory", "season"]
+    elif "week_id" in df.columns:
+        keys = ["store_id", "subcategory", "week_id"]
+    else:
+        keys = ["store_id", "subcategory"]
+
+    df = dedup_sum(df, keys=keys, sum_cols=["seasonal_sellout_units"])
+    df = optimize_dtypes(df)
+
+    print(f"    ✓ {len(df):,} store-subcategory rows loaded")
+    return df
+
+@lru_cache(maxsize=1)
+def read_f_active_store_item(file: str) -> pd.DataFrame:
+    """
+    F_ACTIVE_STORE_ITEM: Active Store-Item Combinations (MANDATORY FILTER)
+    Grain: store_id × client_item_nbr
+
+    Data structure:
+    - two columns: store_id, client_item_nbr
+    - may be headered OR headerless (2 columns starting A1)
+    """
+    print("  Loading F_ACTIVE_STORE_ITEM (active combinations filter)...")
+
+    # Try headered read first
+    df = pd.read_excel(file, engine="openpyxl")
+    df = lower_cols(df)
+
+    rename_map = {"store nbr": "store_id", "item nbr": "client_item_nbr"}
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    required = ["store_id", "client_item_nbr"]
+    if not all(c in df.columns for c in required):
+        # Headerless fallback: exactly 2 columns => assume [store_id, client_item_nbr]
+        if df.shape[1] == 2:
+            df.columns = required
+        else:
+            missing = [c for c in required if c not in df.columns]
+            raise ValueError(f"F_ACTIVE_STORE_ITEM MUST have columns {required} (or 2-column headerless). Missing: {missing}")
+
+    df = df[required].copy()
+    df = normalize_keys(df)
+    df = df.drop_duplicates(subset=required)
+
+    print(f"    ✓ {len(df):,} ACTIVE store-item combinations loaded")
+    print("    ⚠️  CRITICAL: Only these combinations will appear in KPIs/actions/insights")
+    return df
+
+########################
+# TIME SEMANTICS       #
+########################
+
+def derive_yoy_comparator_df(f_ly_all: pd.DataFrame, current_week_id: str, yoy_week_id_ly: str) -> pd.DataFrame:
+    """
+    Create a YoY comparator dataframe aligned to the *current* week_id for joining to the gold fact.
+
+    Returns columns:
+    - store_id
+    - client_item_nbr
+    - week_id (current_week_id for join)
+    - week_id_ly_yoy (original LY comparator week id)
+    - sellout_units_ly_yoy
+    """
+    if not yoy_week_id_ly:
+        return pd.DataFrame(columns=["store_id", "client_item_nbr", "week_id", "week_id_ly_yoy", "sellout_units_ly_yoy"])
+
+    df = f_ly_all[f_ly_all["week_id"] == str(yoy_week_id_ly)].copy()
+    if len(df) == 0:
+        return pd.DataFrame(columns=["store_id", "client_item_nbr", "week_id", "week_id_ly_yoy", "sellout_units_ly_yoy"])
+
+    df = df.rename(columns={"week_id": "week_id_ly_yoy", "sellout_units_ly": "sellout_units_ly_yoy"})
+    df["week_id"] = str(current_week_id)
+    df = df[["store_id", "client_item_nbr", "week_id", "week_id_ly_yoy", "sellout_units_ly_yoy"]]
+    df = normalize_keys(df)
+    df = dedup_sum(df, keys=["store_id", "client_item_nbr", "week_id"], sum_cols=["sellout_units_ly_yoy"])
+    return df
+
+def select_history_window(f_ly_all: pd.DataFrame, yoy_week_id_ly: str, history_window_weeks: int) -> pd.DataFrame:
+    """
+    Best-effort selection of a LY history window for evidence metrics.
+
+    Strategy:
+    - If week_id parses as YYYYWW and yoy_week_id_ly parses too:
+        select weeks in same LY year with week <= yoy_week, then keep last N weeks.
+    - Else:
+        keep all weeks (no reliable window).
+    """
+    if history_window_weeks is None or int(history_window_weeks) <= 0:
+        return f_ly_all.copy()
+
+    yw = try_parse_year_week(yoy_week_id_ly) if yoy_week_id_ly else None
+    if yw is None:
+        return f_ly_all.copy()
+
+    ly_year, ly_week = yw
+
+    # Parse week_id into year/week for filtering
+    parsed = f_ly_all["week_id"].apply(lambda x: try_parse_year_week(str(x)))
+    mask_valid = parsed.notna()
+    if mask_valid.sum() == 0:
+        return f_ly_all.copy()
+
+    y = parsed[mask_valid].apply(lambda t: t[0]).astype(int)
+    w = parsed[mask_valid].apply(lambda t: t[1]).astype(int)
+
+    tmp = f_ly_all.loc[mask_valid].copy()
+    tmp["_year"] = y.values
+    tmp["_week"] = w.values
+
+    tmp = tmp[(tmp["_year"] == ly_year) & (tmp["_week"] <= ly_week)].copy()
+
+    if tmp.empty:
+        return f_ly_all.copy()
+
+    # Keep last N weeks (by week number)
+    weeks_sorted = sorted(tmp["_week"].unique())
+    last_weeks = set(weeks_sorted[-int(history_window_weeks):])
+    tmp = tmp[tmp["_week"].isin(last_weeks)].copy()
+    tmp.drop(columns=["_year", "_week"], inplace=True, errors="ignore")
+    return tmp
+
+def compute_history_metrics(f_ly_window: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute store-item evidence metrics from a multi-week LY window.
+
+    Outputs:
+    - history_weeks: number of distinct week_id present
+    - history_units: total units across window
+    - history_mean/history_std/history_cv: volatility signal (std/mean)
+    """
+    if f_ly_window is None or f_ly_window.empty:
+        return pd.DataFrame(columns=["store_id", "client_item_nbr", "history_weeks", "history_units", "history_mean", "history_std", "history_cv"])
+
+    weekly = (
+        f_ly_window.groupby(["store_id", "client_item_nbr", "week_id"], as_index=False, dropna=False)
+        .agg({"sellout_units_ly": "sum"})
+    )
+
+    agg = (
+        weekly.groupby(["store_id", "client_item_nbr"], as_index=False, dropna=False)
+        .agg(
+            history_weeks=("week_id", "nunique"),
+            history_units=("sellout_units_ly", "sum"),
+            history_mean=("sellout_units_ly", "mean"),
+            history_std=("sellout_units_ly", "std"),
         )
+    )
 
-        run_btn.click(
-            _run,
-            inputs=[file_current_p, file_wk5_p, file_next4_p, file_store_subcat_p, file_item_lookup_p,
-                   file_store_lookup_p, file_valid_item_trait_p, lead_p, buffer_p, hhi_thr_p, share_pp_p,
-                   store_trait_filter, state_filter, level0_filter, brand_filter, item_filter, show_store_item_check],
-            outputs=[
-                # In-stock (5)
-                t_instock_trait, t_instock_state, t_instock_level0, t_instock_brand, t_instock_item,
-                # Slow movers (4)
-                t_slow_trait, t_slow_state, t_slow_level0, t_slow_brand,
-                # Compliance (4)
-                t_comp_trait, t_comp_state, t_comp_level0, t_comp_brand,
-                # Forecast (4)
-                t_fc_trait, t_fc_state, t_fc_level0, t_fc_brand,
-                # Risk (4)
-                t_risk_trait, t_risk_state, t_risk_level0, t_risk_brand,
-                # HHI (4)
-                t_hhi_trait, t_hhi_state, t_hhi_level0, t_hhi_brand,
-                # Over-concentration (4)
-                t_over_trait, t_over_state, t_over_level0, t_over_brand,
-                # Charts (4)
-                p1, p2, p3, p4,
-                # Files (1)
-                files,
-                # Filters (5)
-                store_trait_filter, state_filter, level0_filter, brand_filter, item_filter,
-                # State (1)
-                dataframes_state
-            ]
+    agg["history_std"] = agg["history_std"].fillna(0)
+    agg["history_cv"] = np.where(agg["history_mean"] > 0, agg["history_std"] / agg["history_mean"], np.nan)
+
+    agg = optimize_dtypes(agg)
+    agg = normalize_keys(agg)
+    return agg
+
+########################
+# DATA PROFILING       #
+########################
+
+def print_data_profile(
+    dim_item: pd.DataFrame,
+    dim_store: pd.DataFrame,
+    f_ly_all: pd.DataFrame,
+    f_current: pd.DataFrame,
+    f_season: pd.DataFrame,
+    f_active: pd.DataFrame,
+    current_week_id: str,
+    yoy_week_id_ly: str,
+) -> None:
+    """Data quality profile before building gold fact"""
+    print("\n[DATA PROFILE]")
+
+    print("\n  DIM_ITEM:")
+    print(f"    Items: {len(dim_item):,}")
+    print(f"    Duplicates: {dim_item.duplicated(subset=['client_item_nbr']).sum()}")
+
+    print("\n  DIM_STORE:")
+    print(f"    Stores: {len(dim_store):,}")
+    print(f"    Duplicates: {dim_store.duplicated(subset=['store_id']).sum()}")
+
+    print("\n  F_STORE_ITEM_LY (ALL WEEKS):")
+    print(f"    Rows: {len(f_ly_all):,}")
+    print(f"    Unique weeks: {f_ly_all['week_id'].nunique() if 'week_id' in f_ly_all.columns else 'N/A'}")
+    print(f"    Duplicates (store-item-week): {f_ly_all.duplicated(subset=['store_id','client_item_nbr','week_id']).sum()}")
+
+    print("\n  F_STORE_ITEM_CURRENT:")
+    print(f"    Rows: {len(f_current):,}")
+    print(f"    Duplicates (store-item): {f_current.duplicated(subset=['store_id','client_item_nbr']).sum()}")
+    print(f"    week_id (analysis): {current_week_id}")
+
+    print("\n  F_STORE_SUBCATEGORY_SEASON:")
+    print(f"    Rows: {len(f_season):,}")
+
+    print("\n  F_ACTIVE_STORE_ITEM (MANDATORY FILTER):")
+    print(f"    Active combinations: {len(f_active):,}")
+    print(f"    Duplicates: {f_active.duplicated(subset=['store_id','client_item_nbr']).sum()}")
+
+    # Catalog coverage
+    print("\n  Catalog Coverage:")
+
+    # Stores
+    current_stores = set(f_current["store_id"].unique())
+    catalog_stores = set(dim_store["store_id"].unique())
+    store_match = len(current_stores & catalog_stores)
+    store_pct = (store_match / len(current_stores) * 100) if len(current_stores) > 0 else 0
+    print(f"    Stores: {store_pct:.1f}% ({store_match:,}/{len(current_stores):,})")
+    if len(current_stores - catalog_stores) > 0:
+        print(f"    ⚠️  Unmatched stores: {len(current_stores - catalog_stores):,}")
+
+    # Items
+    current_items = set(f_current["client_item_nbr"].unique())
+    catalog_items = set(dim_item["client_item_nbr"].unique())
+    item_match = len(current_items & catalog_items)
+    item_pct = (item_match / len(current_items) * 100) if len(current_items) > 0 else 0
+    print(f"    Items: {item_pct:.1f}% ({item_match:,}/{len(current_items):,})")
+    if len(current_items - catalog_items) > 0:
+        print(f"    ⚠️  Unmatched items: {len(current_items - catalog_items):,}")
+
+    # YoY coverage (best-effort)
+    if yoy_week_id_ly:
+        f_ly_yoy = f_ly_all[f_ly_all["week_id"] == str(yoy_week_id_ly)]
+        yoy_combos = len(f_ly_yoy.drop_duplicates(subset=["store_id", "client_item_nbr"]))
+        current_combos = len(f_current.drop_duplicates(subset=["store_id", "client_item_nbr"]))
+        yoy_pct = (yoy_combos / current_combos * 100) if current_combos > 0 else 0
+        print("\n  YoY Comparator Coverage:")
+        print(f"    yoy_week_id_ly: {yoy_week_id_ly}")
+        print(f"    Coverage: {yoy_pct:.1f}% ({yoy_combos:,}/{current_combos:,} store-items)")
+    else:
+        print("\n  YoY Comparator Coverage:")
+        print("    ⚠️  yoy_week_id_ly not set (cannot assess YoY mapping)")
+
+    # ACTIVE FILTER IMPACT (CRITICAL)
+    print("\n  Active Filter Impact:")
+    active_set = set(f_active[["store_id", "client_item_nbr"]].apply(tuple, axis=1))
+    current_set = set(f_current[["store_id", "client_item_nbr"]].apply(tuple, axis=1))
+    overlap = len(active_set & current_set)
+    inactive_count = len(current_set - active_set)
+    active_pct = (overlap / len(current_set) * 100) if len(current_set) > 0 else 0
+
+    print(f"    Active coverage: {active_pct:.1f}% of current snapshot")
+    print(f"    Combinations to keep: {overlap:,}")
+    if inactive_count > 0:
+        print(f"    ⚠️  Inactive combinations to be removed: {inactive_count:,}")
+    else:
+        print("    ✓ All current combinations are active")
+
+########################
+# GOLD FACT BUILDER    #
+########################
+
+def build_gold_fact_base(
+    f_current: pd.DataFrame,
+    f_ly_yoy: pd.DataFrame,
+    dim_item: pd.DataFrame,
+    dim_store: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Build gold fact BASE (before ACTIVE filter and before multi-week history merge)
+    Grain: store_id × client_item_nbr × week_id
+    """
+    print("\n[BUILDING GOLD FACT BASE: F_STORE_ITEM_WEEK]")
+
+    fact = f_current.copy()
+    print(f"  Base (current): {len(fact):,} rows")
+
+    # Join YoY comparator (already aligned to current week_id)
+    if f_ly_yoy is not None and not f_ly_yoy.empty:
+        fact = safe_merge(fact, f_ly_yoy, on=["store_id", "client_item_nbr", "week_id"], how="left")
+        if "sellout_units_ly_yoy" in fact.columns:
+            fact["sellout_units_ly_yoy"] = fact["sellout_units_ly_yoy"].fillna(0)
+        else:
+            fact["sellout_units_ly_yoy"] = 0
+        print(f"  After YoY join: {len(fact):,} rows")
+    else:
+        fact["sellout_units_ly_yoy"] = 0
+        print("  ⚠️  YoY comparator not available; sellout_units_ly_yoy set to 0")
+
+    # Join DIM_ITEM
+    fact = safe_merge(fact, dim_item, on=["client_item_nbr"], how="left")
+    print(f"  After DIM_ITEM join: {len(fact):,} rows")
+
+    # Join DIM_STORE
+    fact = safe_merge(fact, dim_store, on=["store_id"], how="left")
+    print(f"  After DIM_STORE join: {len(fact):,} rows")
+
+    # Smart dedup: preserve dims, sum measures
+    initial_rows = len(fact)
+
+    dimension_cols = [
+        "week_id", "as_of_date", "week_id_ly_yoy",  # TIME
+        "store_id", "client_item_nbr",              # KEYS
+        # STORE DIMS
+        "store_name", "state", "region", "store_tier", "store_format", "cluster",
+        # ITEM DIMS
+        "item_desc", "subcategory", "category", "brand", "item_status",
+    ]
+    measure_cols = ["sellout_units_lw", "on_hand_units", "on_order_units", "sellout_units_ly_yoy"]
+
+    dim_keep = [c for c in dimension_cols if c in fact.columns]
+    meas_sum = [c for c in measure_cols if c in fact.columns]
+
+    group_keys = ["store_id", "client_item_nbr"]
+    if "week_id" in fact.columns:
+        group_keys.append("week_id")
+
+    agg_dict = {c: "first" for c in dim_keep if c not in group_keys}
+    agg_dict.update({c: "sum" for c in meas_sum})
+
+    fact = fact.groupby(group_keys, dropna=False, as_index=False).agg(agg_dict)
+
+    if len(fact) < initial_rows:
+        print(f"  ⚠️  Dedup removed {initial_rows - len(fact):,} rows")
+
+    print(f"✓ Gold fact BASE built: {len(fact):,} rows (before active filter)")
+    return fact
+
+def apply_active_filter(fact: pd.DataFrame, f_active: pd.DataFrame) -> pd.DataFrame:
+    """MANDATORY: keep only active store-item combinations (semi-join via inner merge)."""
+    print("\n[APPLYING MANDATORY ACTIVE FILTER]")
+
+    initial_rows = len(fact)
+    fact = fact.merge(f_active, on=["store_id", "client_item_nbr"], how="inner")
+
+    removed_rows = initial_rows - len(fact)
+    removed_pct = (removed_rows / initial_rows * 100) if initial_rows > 0 else 0
+
+    print(f"  Before filter: {initial_rows:,} rows")
+    print(f"  After filter:  {len(fact):,} rows")
+    if removed_rows > 0:
+        print(f"  ⚠️  REMOVED {removed_rows:,} INACTIVE combinations ({removed_pct:.1f}%)")
+    else:
+        print("  ✓ All combinations were already active")
+
+    return fact
+
+########################
+# KPI CALCULATIONS     #
+########################
+
+def add_history_metrics(fact: pd.DataFrame, history_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Merge store-item history metrics into gold fact (store-item level)."""
+    if history_metrics is None or history_metrics.empty:
+        fact["history_weeks"] = 0
+        fact["history_units"] = 0
+        fact["history_cv"] = np.nan
+        return fact
+
+    fact = safe_merge(fact, history_metrics, on=["store_id", "client_item_nbr"], how="left")
+    if "history_weeks" in fact.columns:
+        fact["history_weeks"] = fact["history_weeks"].fillna(0).astype(int)
+    else:
+        fact["history_weeks"] = 0
+
+    if "history_units" in fact.columns:
+        fact["history_units"] = fact["history_units"].fillna(0)
+    else:
+        fact["history_units"] = 0
+
+    if "history_cv" in fact.columns:
+        fact["history_cv"] = fact["history_cv"].replace([np.inf, -np.inf], np.nan)
+    else:
+        fact["history_cv"] = np.nan
+
+    return fact
+
+def compute_confidence(df: pd.DataFrame, kpi_rules: dict) -> pd.Series:
+    """Return kpi_confidence label per row based on multi-week evidence."""
+    threshold_weeks = int(kpi_rules.get("new_item_history_threshold_weeks", 4))
+    threshold_units = float(kpi_rules.get("low_history_threshold_units", 10))
+    high_mult = float(kpi_rules.get("high_confidence_units_multiplier", 3))
+    cv_thresh = float(kpi_rules.get("history_volatility_cv_threshold", 1.5))
+
+    low_mask = (df["history_weeks"] < threshold_weeks) | (df["history_units"] < threshold_units)
+
+    # Start as LOW
+    conf = pd.Series(np.where(low_mask, "LOW", "MEDIUM"), index=df.index, dtype="object")
+
+    # Upgrade to HIGH when strong evidence and not too volatile
+    units_high = df["history_units"] >= (threshold_units * high_mult)
+    cv_ok = df["history_cv"].fillna(0) <= cv_thresh
+    conf[(~low_mask) & units_high & cv_ok] = "HIGH"
+
+    return conf
+
+def calculate_kpis(fact: pd.DataFrame, kpi_rules: dict) -> pd.DataFrame:
+    """Calculate KPIs + flags + confidence (all store-item level; only ACTIVE combos reach here)."""
+    print("\n[CALCULATING KPIs + CONFIDENCE]")
+
+    df = fact.copy()
+
+    # Thresholds
+    min_safety_days = float(kpi_rules.get("min_safety_stock_days", 7))
+    overstock_days = float(kpi_rules.get("overstock_threshold_days", 60))
+    low_history_threshold_units = float(kpi_rules.get("low_history_threshold_units", 10))
+    min_history_weeks = int(kpi_rules.get("new_item_history_threshold_weeks", 4))
+
+    # 1) YoY Growth % (LW vs same-week LY comparator)
+    df["yoy_growth_pct"] = np.where(
+        df["sellout_units_ly_yoy"] > 0,
+        ((df["sellout_units_lw"] - df["sellout_units_ly_yoy"]) / df["sellout_units_ly_yoy"]) * 100,
+        np.nan,
+    )
+
+    # 2) Sell-Through %
+    df["beginning_inv"] = df["on_hand_units"] + df["sellout_units_lw"]
+    df["sellthrough_pct"] = np.where(
+        df["beginning_inv"] > 0,
+        (df["sellout_units_lw"] / df["beginning_inv"]) * 100,
+        np.nan,
+    )
+
+    # 3) Coverage Days (simple LW / 7 assumption)
+    df["avg_daily_sellout"] = df["sellout_units_lw"] / 7
+    df["coverage_days"] = np.where(
+        df["avg_daily_sellout"] > 0,
+        df["on_hand_units"] / df["avg_daily_sellout"],
+        np.nan,
+    )
+
+    # 4) Inventory Turns (annualized from LW)
+    df["inventory_turns_annual"] = np.where(
+        df["on_hand_units"] > 0,
+        (df["sellout_units_lw"] * 52) / df["on_hand_units"],
+        np.nan,
+    )
+
+    # 5) In-Stock
+    df["in_stock"] = (df["on_hand_units"] > 0).astype(int)
+
+    # 6) KPI confidence (HIGH/MEDIUM/LOW) using multi-week evidence
+    if "history_weeks" not in df.columns:
+        df["history_weeks"] = 0
+    if "history_units" not in df.columns:
+        df["history_units"] = 0.0
+    if "history_cv" not in df.columns:
+        df["history_cv"] = np.nan
+
+    df["kpi_confidence"] = compute_confidence(df, kpi_rules)
+
+    # 7) Low History Flag (TRUE low evidence, not same-week LY demand)
+    df["low_history_flag"] = (
+        (df["history_weeks"] < min_history_weeks) | (df["history_units"] < low_history_threshold_units)
+    ).astype(int)
+
+    # 8) OOS Risk Flag
+    df["oos_risk_flag"] = (
+        ((df["sellout_units_lw"] > 0) & (df["on_hand_units"] == 0))
+        | (df["coverage_days"] < min_safety_days)
+    ).astype(int)
+
+    # 9) Overstock Flag
+    df["overstock_flag"] = (df["coverage_days"] > overstock_days).fillna(0).astype(int)
+
+    # Cleanup temp columns
+    df.drop(columns=["beginning_inv", "avg_daily_sellout"], inplace=True, errors="ignore")
+
+    print(f"✓ KPIs calculated for {len(df):,} ACTIVE rows")
+    print(f"  - kpi_confidence LOW: {(df['kpi_confidence']=='LOW').sum():,}")
+    print(f"  - OOS risk flags: {df['oos_risk_flag'].sum():,}")
+    print(f"  - Overstock flags: {df['overstock_flag'].sum():,}")
+
+    return df
+
+########################
+# FALLBACK LOGIC       #
+########################
+
+def apply_fallback_logic(fact_kpi: pd.DataFrame, f_season: pd.DataFrame) -> pd.DataFrame:
+    """
+    For items with low_history_flag=1:
+    - Join store-subcategory seasonal weights
+    - Compute store_subcategory_weight (allocation proxy)
+    - Flag used_subcategory_proxy (for explainability)
+    """
+    print("\n[APPLYING FALLBACK LOGIC]")
+
+    if "low_history_flag" not in fact_kpi.columns:
+        fact_kpi["low_history_flag"] = 0
+
+    low_history_items = fact_kpi[fact_kpi["low_history_flag"] == 1].copy()
+
+    # Defaults
+    fact_kpi["store_subcategory_weight"] = fact_kpi.get("store_subcategory_weight", 0)
+    fact_kpi["used_subcategory_proxy"] = 0
+
+    if low_history_items.empty:
+        print("  No low-history items requiring fallback")
+        return fact_kpi
+
+    print(f"  Processing {len(low_history_items):,} low-history store-items")
+
+    if f_season is None or f_season.empty or "subcategory" not in f_season.columns:
+        print("  ⚠️  F_STORE_SUBCATEGORY_SEASON not available for fallback")
+        return fact_kpi
+
+    # Aggregate seasonal by store-subcategory
+    season_agg = f_season.groupby(["store_id", "subcategory"], as_index=False).agg({"seasonal_sellout_units": "sum"})
+    subcat_totals = (
+        season_agg.groupby("subcategory", as_index=False)
+        .agg({"seasonal_sellout_units": "sum"})
+        .rename(columns={"seasonal_sellout_units": "subcat_total"})
+    )
+
+    season_agg = safe_merge(season_agg, subcat_totals, on=["subcategory"], how="left")
+    season_agg["store_subcategory_weight"] = np.where(
+        season_agg["subcat_total"] > 0, season_agg["seasonal_sellout_units"] / season_agg["subcat_total"], 0
+    )
+
+    # Join weights to low history items
+    low_history_items = safe_merge(
+        low_history_items,
+        season_agg[["store_id", "subcategory", "store_subcategory_weight"]],
+        on=["store_id", "subcategory"],
+        how="left",
+    )
+    low_history_items["store_subcategory_weight"] = low_history_items["store_subcategory_weight"].fillna(0)
+
+    # Merge back to main fact (store-item level)
+    fact_kpi = fact_kpi.merge(
+        low_history_items[["store_id", "client_item_nbr", "store_subcategory_weight"]],
+        on=["store_id", "client_item_nbr"],
+        how="left",
+        suffixes=("", "_new"),
+    )
+
+    # Prefer new weight where available
+    if "store_subcategory_weight_new" in fact_kpi.columns:
+        fact_kpi["store_subcategory_weight"] = np.where(
+            fact_kpi["store_subcategory_weight_new"].notna(),
+            fact_kpi["store_subcategory_weight_new"],
+            fact_kpi["store_subcategory_weight"],
         )
+        fact_kpi.drop(columns=["store_subcategory_weight_new"], inplace=True, errors="ignore")
 
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
+    fact_kpi["store_subcategory_weight"] = fact_kpi["store_subcategory_weight"].fillna(0)
+    fact_kpi["used_subcategory_proxy"] = np.where(
+        (fact_kpi["low_history_flag"] == 1) & (fact_kpi["store_subcategory_weight"] > 0), 1, 0
+    )
+
+    print(f"  ✓ Assigned subcategory weights to {(fact_kpi['store_subcategory_weight'] > 0).sum():,} items")
+    return fact_kpi
+
+########################
+# AGGREGATION ENGINE   #
+########################
+
+def aggregate_by_dimension(fact_kpi: pd.DataFrame, group_by: List[str]) -> pd.DataFrame:
+    """Aggregate KPIs by specified dimensions (recompute KPIs at aggregate level)."""
+    agg_dict = {
+        # Measures (sum)
+        "sellout_units_lw": "sum",
+        "on_hand_units": "sum",
+        "sellout_units_ly_yoy": "sum",
+
+        # Flags (sum = count)
+        "low_history_flag": "sum",
+        "oos_risk_flag": "sum",
+        "overstock_flag": "sum",
+
+        # In-stock percent
+        "in_stock": "mean",
+    }
+
+    if not group_by:
+        agg = pd.DataFrame({
+            "sellout_units_lw": [fact_kpi["sellout_units_lw"].sum()],
+            "on_hand_units": [fact_kpi["on_hand_units"].sum()],
+            "sellout_units_ly_yoy": [fact_kpi["sellout_units_ly_yoy"].sum()],
+            "low_history_flag": [fact_kpi["low_history_flag"].sum()],
+            "oos_risk_flag": [fact_kpi["oos_risk_flag"].sum()],
+            "overstock_flag": [fact_kpi["overstock_flag"].sum()],
+            "in_stock": [fact_kpi["in_stock"].mean()],
+        })
+    else:
+        agg = fact_kpi.groupby(group_by, dropna=False, as_index=False).agg(agg_dict)
+
+    # Recalculate KPIs at aggregated level
+    agg["yoy_growth_pct"] = np.where(
+        agg["sellout_units_ly_yoy"] > 0,
+        ((agg["sellout_units_lw"] - agg["sellout_units_ly_yoy"]) / agg["sellout_units_ly_yoy"]) * 100,
+        np.nan,
+    )
+
+    agg["beginning_inv"] = agg["on_hand_units"] + agg["sellout_units_lw"]
+    agg["sellthrough_pct"] = np.where(
+        agg["beginning_inv"] > 0,
+        (agg["sellout_units_lw"] / agg["beginning_inv"]) * 100,
+        np.nan,
+    )
+
+    agg["avg_daily_sellout"] = agg["sellout_units_lw"] / 7
+    agg["coverage_days"] = np.where(
+        agg["avg_daily_sellout"] > 0,
+        agg["on_hand_units"] / agg["avg_daily_sellout"],
+        np.nan,
+    )
+
+    agg["inventory_turns_annual"] = np.where(
+        agg["on_hand_units"] > 0,
+        (agg["sellout_units_lw"] * 52) / agg["on_hand_units"],
+        np.nan,
+    )
+
+    agg["instock_pct"] = (agg["in_stock"] * 100).round(1)
+
+    agg.drop(columns=["beginning_inv", "avg_daily_sellout", "in_stock"], inplace=True, errors="ignore")
+
+    # Round numeric
+    for col in agg.select_dtypes(include=[np.number]).columns:
+        if "pct" in col or "turns" in col or "coverage" in col:
+            agg[col] = agg[col].round(1)
+        elif "flag" not in col:
+            agg[col] = agg[col].round(0)
+
+    return agg
+
+def generate_kpi_tables(fact_kpi: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Generate KPI tables at different aggregation levels."""
+    print("\n[GENERATING KPI TABLES]")
+
+    outputs: Dict[str, pd.DataFrame] = {}
+
+    outputs["total_company"] = aggregate_by_dimension(fact_kpi, [])
+    outputs["total_company"]["level"] = "Total Company"
+    print("  ✓ Total Company")
+
+    if "brand" in fact_kpi.columns:
+        outputs["by_brand"] = aggregate_by_dimension(fact_kpi, ["brand"])
+        print(f"  ✓ By Brand ({len(outputs['by_brand'])} rows)")
+
+    if "category" in fact_kpi.columns:
+        outputs["by_category"] = aggregate_by_dimension(fact_kpi, ["category"])
+        print(f"  ✓ By Category ({len(outputs['by_category'])} rows)")
+
+    if "subcategory" in fact_kpi.columns:
+        outputs["by_subcategory"] = aggregate_by_dimension(fact_kpi, ["subcategory"])
+        print(f"  ✓ By Subcategory ({len(outputs['by_subcategory'])} rows)")
+
+    if "store_tier" in fact_kpi.columns:
+        outputs["by_store_tier"] = aggregate_by_dimension(fact_kpi, ["store_tier"])
+        print(f"  ✓ By Store Tier ({len(outputs['by_store_tier'])} rows)")
+
+    region_col = "region" if "region" in fact_kpi.columns else "state"
+    if region_col in fact_kpi.columns:
+        outputs[f"by_{region_col}"] = aggregate_by_dimension(fact_kpi, [region_col])
+        print(f"  ✓ By {region_col.title()} ({len(outputs[f'by_{region_col}'])} rows)")
+
+    if "brand" in fact_kpi.columns and "store_tier" in fact_kpi.columns:
+        outputs["brand_x_tier"] = aggregate_by_dimension(fact_kpi, ["brand", "store_tier"])
+        print(f"  ✓ Brand × Tier ({len(outputs['brand_x_tier'])} rows)")
+
+    outputs["store_item_detail"] = fact_kpi.copy()
+    print(f"  ✓ Store-Item Detail ({len(outputs['store_item_detail'])} rows)")
+
+    return outputs
+
+########################
+# ACTIONS & INSIGHTS   #
+########################
+
+def _compute_severity(df: pd.DataFrame, flag_name: str, kpi_rules: dict) -> pd.Series:
+    """Severity score used to rank store-item actions (higher = more severe)."""
+    min_safety_days = float(kpi_rules.get("min_safety_stock_days", 7))
+    overstock_days = float(kpi_rules.get("overstock_threshold_days", 60))
+    threshold_weeks = int(kpi_rules.get("new_item_history_threshold_weeks", 4))
+    threshold_units = float(kpi_rules.get("low_history_threshold_units", 10))
+
+    coverage = df.get("coverage_days", pd.Series(np.nan, index=df.index)).fillna(0)
+
+    if flag_name == "oos_risk_flag":
+        inv0_and_selling = (df.get("on_hand_units", 0) == 0) & (df.get("sellout_units_lw", 0) > 0)
+        return np.where(inv0_and_selling, 1e9, np.maximum(0, min_safety_days - coverage))
+    if flag_name == "overstock_flag":
+        return np.maximum(0, coverage - overstock_days)
+    if flag_name == "low_history_flag":
+        hw = df.get("history_weeks", 0).fillna(0)
+        hu = df.get("history_units", 0).fillna(0)
+        gap_w = np.maximum(0, threshold_weeks - hw)
+        gap_u = np.maximum(0, threshold_units - hu)
+        return gap_w + (gap_u / max(threshold_units, 1.0))
+    return pd.Series(0, index=df.index)
+
+def generate_store_item_actions(fact_kpi: pd.DataFrame, kpi_rules: dict, action_map: dict) -> pd.DataFrame:
+    """
+    Generate store-item actions (top N) driven by flag_actions dictionary.
+    Output: store_item_actions table for execution.
+    """
+    print("\n[GENERATING STORE-ITEM ACTIONS]")
+
+    flag_actions = action_map.get("flag_actions", {})
+    if not flag_actions:
+        print("  ⚠️  No flag_actions found in action_map; skipping.")
+        return pd.DataFrame()
+
+    pr_rank = action_map.get("priority_rank", DEFAULT_ACTION_MAP["priority_rank"])
+    downrank_low_conf = bool(action_map.get("downrank_low_confidence", True))
+    top_n = int(action_map.get("store_item_actions_top_n", 50))
+
+    frames = []
+    for flag_name, spec in flag_actions.items():
+        if flag_name not in fact_kpi.columns:
+            continue
+
+        df_flag = fact_kpi[fact_kpi[flag_name] == 1].copy()
+        if df_flag.empty:
+            continue
+
+        priority = str(spec.get("priority", "MEDIUM")).upper()
+        df_flag["flag_name"] = flag_name
+        df_flag["owner"] = " / ".join(spec.get("owner", [])) if isinstance(spec.get("owner"), list) else str(spec.get("owner", ""))
+        df_flag["action"] = str(spec.get("action", "")).strip()
+        df_flag["priority"] = priority
+        df_flag["priority_rank"] = int(pr_rank.get(priority, 99))
+        df_flag["severity_score"] = _compute_severity(df_flag, flag_name, kpi_rules)
+
+        # Downrank low confidence for sorting (except low_history_flag which is explicitly about confidence)
+        df_flag["priority_rank_adj"] = df_flag["priority_rank"]
+        if downrank_low_conf and "kpi_confidence" in df_flag.columns and flag_name != "low_history_flag":
+            df_flag.loc[df_flag["kpi_confidence"] == "LOW", "priority_rank_adj"] = np.minimum(df_flag["priority_rank"] + 1, 4)
+
+        # Store templates to format later (after top-N selection)
+        df_flag["_rationale_template"] = spec.get("rationale_template", "")
+        df_flag["_next_step_template"] = spec.get("next_step_template", "")
+
+        frames.append(df_flag)
+
+    if not frames:
+        print("  No store-item actions generated (no flags triggered).")
+        return pd.DataFrame()
+
+    actions = pd.concat(frames, ignore_index=True)
+
+    # Sort and keep top N
+    actions = actions.sort_values(
+        by=["priority_rank_adj", "severity_score", "sellout_units_lw"],
+        ascending=[True, False, False],
+        kind="mergesort",
+    ).head(top_n)
+
+    # Format rationale/next steps for the selected actions only
+    def _format_row(row: pd.Series) -> pd.Series:
+        ctx = row.to_dict()
+        ctx.update(kpi_rules)
+        row["rationale"] = safe_format(row.get("_rationale_template", ""), ctx)
+        row["next_step"] = safe_format(row.get("_next_step_template", ""), ctx)
+        return row
+
+    actions = actions.apply(_format_row, axis=1)
+
+    # Keep a clean column set (execution-ready)
+    keep_cols = [
+        "priority", "owner", "action", "flag_name",
+        "store_id", "client_item_nbr", "week_id",
+        "brand", "category", "subcategory",
+        "store_tier", "region", "state",
+        "sellout_units_lw", "on_hand_units", "coverage_days",
+        "sellout_units_ly_yoy", "yoy_growth_pct",
+        "history_weeks", "history_units", "history_cv", "kpi_confidence",
+        "store_subcategory_weight", "used_subcategory_proxy",
+        "severity_score", "rationale", "next_step"
+    ]
+    keep_cols = [c for c in keep_cols if c in actions.columns]
+
+    actions = actions[keep_cols].reset_index(drop=True)
+
+    print(f"✓ Store-item actions generated: {len(actions):,} (top N={top_n})")
+    return actions
+
+def generate_action_rollup(actions_df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+    """Roll up store-item actions for exec summaries."""
+    if actions_df is None or actions_df.empty:
+        return pd.DataFrame()
+
+    group_cols = [c for c in group_cols if c in actions_df.columns]
+    if not group_cols:
+        return pd.DataFrame()
+
+    tmp = actions_df.copy()
+    tmp["store_item_key"] = tmp["store_id"].astype(str) + "||" + tmp["client_item_nbr"].astype(str)
+
+    roll = (
+        tmp.groupby(group_cols + ["priority", "owner", "action", "flag_name"], as_index=False, dropna=False)
+        .agg(
+            action_rows=("store_item_key", "size"),
+            affected_store_items=("store_item_key", "nunique"),
+            sellout_units_lw=("sellout_units_lw", "sum"),
+            on_hand_units=("on_hand_units", "sum"),
+        )
+    )
+
+    # Priority ranking for sorting
+    pr_map = DEFAULT_ACTION_MAP["priority_rank"]
+    roll["priority_rank"] = roll["priority"].map(pr_map).fillna(99).astype(int)
+
+    roll = roll.sort_values(["priority_rank"] + group_cols + ["action_rows"], ascending=[True] + [True]*len(group_cols) + [False])
+    roll.drop(columns=["priority_rank"], inplace=True, errors="ignore")
+    return roll
+
+def generate_commercial_insights(outputs: Dict[str, pd.DataFrame], actions_rollup_brand: pd.DataFrame, kpi_rules: dict) -> pd.DataFrame:
+    """
+    Exec-friendly insights:
+    - opportunities from by_brand (YoY winners + healthy coverage)
+    - risk summaries from action rollup (brand-level)
+    """
+    print("\n[GENERATING COMMERCIAL INSIGHTS]")
+
+    insights: List[Dict[str, Any]] = []
+    coverage_target = float(kpi_rules.get("coverage_target_days", 14))
+
+    # Opportunities from KPI rollup (brand)
+    if "by_brand" in outputs and not outputs["by_brand"].empty:
+        df = outputs["by_brand"].copy()
+        for _, row in df.iterrows():
+            brand = row.get("brand", "Unknown")
+            yoy = row.get("yoy_growth_pct", np.nan)
+            coverage = row.get("coverage_days", np.nan)
+
+            if pd.notna(yoy) and yoy > 10 and pd.notna(coverage):
+                if coverage >= coverage_target * 0.8 and coverage <= coverage_target * 3:
+                    insights.append({
+                        "scope": "brand",
+                        "scope_value": brand,
+                        "insight_type": "OPPORTUNITY",
+                        "owner": "Sales",
+                        "action": "Invoice / Expand Allocation",
+                        "priority": "HIGH",
+                        "reason": f"YoY +{yoy:.1f}% with coverage {coverage:.0f}d (target {coverage_target:.0f}d)",
+                    })
+
+    # Risks from actions rollup (brand)
+    if actions_rollup_brand is not None and not actions_rollup_brand.empty:
+        top_risks = actions_rollup_brand.copy()
+        # Keep CRITICAL/HIGH only in insights summary
+        top_risks = top_risks[top_risks["priority"].isin(["CRITICAL", "HIGH"])].copy()
+        pr_map = DEFAULT_ACTION_MAP["priority_rank"]
+        top_risks["priority_rank"] = top_risks["priority"].map(pr_map).fillna(99).astype(int)
+        top_risks = top_risks.sort_values(["priority_rank", "action_rows"], ascending=[True, False]).head(25)
+        top_risks.drop(columns=["priority_rank"], inplace=True, errors="ignore")
+
+        for _, row in top_risks.iterrows():
+            insights.append({
+                "scope": "brand",
+                "scope_value": row.get("brand", "Unknown"),
+                "insight_type": f"RISK - {row.get('flag_name','').upper()}",
+                "owner": row.get("owner", ""),
+                "action": row.get("action", ""),
+                "priority": row.get("priority", ""),
+                "reason": f"{int(row.get('affected_store_items',0))} store-items flagged ({int(row.get('action_rows',0))} action rows)",
+            })
+
+    insights_df = pd.DataFrame(insights)
+    if insights_df.empty:
+        print("  No insights generated")
+        return insights_df
+
+    priority_order = DEFAULT_ACTION_MAP["priority_rank"]
+    insights_df["priority_rank"] = insights_df["priority"].map(priority_order).fillna(99).astype(int)
+    insights_df = insights_df.sort_values(["priority_rank", "scope", "scope_value"]).drop(columns=["priority_rank"])
+    print(f"✓ Generated {len(insights_df)} insights")
+    return insights_df
+
+########################
+# EXPORT ENGINE        #
+########################
+
+def export_to_excel(outputs: Dict[str, pd.DataFrame], filename: str = "kpi_tracking_output.xlsx") -> str:
+    filepath = os.path.join(EXPORT_DIR, filename)
+    with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
+        for sheet_name, df in outputs.items():
+            safe_sheet_name = sheet_name[:31]
+            df.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+    print(f"  ✓ Excel: {filepath}")
+    return filepath
+
+def export_to_parquet(outputs: Dict[str, pd.DataFrame], prefix: str = "kpi_tracking") -> List[str]:
+    try:
+        filepaths: List[str] = []
+        for table_name, df in outputs.items():
+            filename = f"{prefix}_{table_name}.parquet"
+            filepath = os.path.join(EXPORT_DIR, filename)
+            df.to_parquet(filepath, index=False, compression="snappy")
+            filepaths.append(filepath)
+        print(f"  ✓ Parquet: {len(filepaths)} files")
+        return filepaths
+    except ImportError:
+        print("  ⚠️  Parquet skipped (install: pip install pyarrow)")
+        return []
+    except Exception as e:
+        print(f"  ⚠️  Parquet failed: {e}")
+        return []
+
+def export_to_csv(outputs: Dict[str, pd.DataFrame], prefix: str = "kpi_tracking") -> List[str]:
+    filepaths: List[str] = []
+    for table_name, df in outputs.items():
+        filename = f"{prefix}_{table_name}.csv"
+        filepath = os.path.join(EXPORT_DIR, filename)
+        df.to_csv(filepath, index=False, encoding="utf-8-sig")
+        filepaths.append(filepath)
+    print(f"  ✓ CSV: {len(filepaths)} files")
+    return filepaths
+
+def export_all_formats(outputs: Dict[str, pd.DataFrame], export_parquet: bool = False) -> Dict[str, Any]:
+    print("\n[EXPORTING RESULTS]")
+    excel_path = export_to_excel(outputs)
+    csv_paths = export_to_csv(outputs)
+    parquet_paths: List[str] = []
+    if export_parquet:
+        parquet_paths = export_to_parquet(outputs)
+    return {"excel": excel_path, "parquet": parquet_paths, "csv": csv_paths}
+
+########################
+# MAIN PIPELINE        #
+########################
+
+def run_kpi_pipeline(cfg: dict) -> Dict[str, pd.DataFrame]:
+    print("\n" + "=" * 60)
+    print(f"  {APP_TITLE}")
+    print("=" * 60 + "\n")
+
+    kpi_rules = load_kpi_rules(cfg.get("kpi_rules_file", "kpi_rules.json"))
+    action_map = load_action_map(cfg.get("action_map_file", "kpi_action_map.json"))
+
+    # Load canonical datasets (5 + active filter)
+    print("[LOADING CANONICAL DATASETS]")
+    dim_item = read_dim_item(cfg["file_dim_item"])
+    dim_store = read_dim_store(cfg["file_dim_store"])
+
+    week_id = str(cfg.get("week_id", "")).strip()
+    as_of_date = str(cfg.get("as_of_date", "")).strip()
+
+    # Explicit time semantics
+    yoy_week_id_ly = str(cfg.get("yoy_week_id_ly", "")).strip() or compute_default_yoy_week_id_ly(week_id)
+    history_window_weeks = int(cfg.get("history_window_weeks", 26))
+
+    f_ly_all = read_f_store_item_ly(cfg["file_f_store_item_ly"])
+    f_current = read_f_store_item_current(cfg["file_f_store_item_current"], week_id, as_of_date)
+    f_season = read_f_store_subcategory_season(cfg["file_f_store_subcategory_season"])
+    f_active = read_f_active_store_item(cfg["file_f_active_store_item"])  # MANDATORY
+
+    # Data profile
+    print_data_profile(dim_item, dim_store, f_ly_all, f_current, f_season, f_active, week_id, yoy_week_id_ly)
+
+    # Build YoY comparator aligned to current week_id
+    f_ly_yoy = derive_yoy_comparator_df(f_ly_all, current_week_id=week_id, yoy_week_id_ly=yoy_week_id_ly)
+    if f_ly_yoy.empty:
+        print(f"\n⚠️  YoY comparator week not found in LY file: yoy_week_id_ly={yoy_week_id_ly}")
+        print("    YoY KPIs will be NaN/0 depending on denominator.\n")
+
+    # Build history window + metrics
+    f_ly_window = select_history_window(f_ly_all, yoy_week_id_ly=yoy_week_id_ly, history_window_weeks=history_window_weeks)
+    history_metrics = compute_history_metrics(f_ly_window)
+
+    print(f"\n[HISTORY WINDOW]")
+    print(f"  history_window_weeks={history_window_weeks}")
+    print(f"  LY window rows: {len(f_ly_window):,} (unique weeks={f_ly_window['week_id'].nunique() if not f_ly_window.empty else 0})")
+    print(f"  history_metrics rows (store-items): {len(history_metrics):,}")
+
+    # Build gold fact BASE, then apply mandatory active filter
+    fact = build_gold_fact_base(f_current, f_ly_yoy, dim_item, dim_store)
+    fact = apply_active_filter(fact, f_active)
+
+    # Merge history metrics AFTER active filter (store-item level)
+    fact = add_history_metrics(fact, history_metrics)
+
+    # Calculate KPIs + confidence
+    fact_kpi = calculate_kpis(fact, kpi_rules)
+
+    # Apply fallback proxy (low confidence items)
+    fact_kpi = apply_fallback_logic(fact_kpi, f_season)
+
+    # Generate KPI rollups
+    outputs = generate_kpi_tables(fact_kpi)
+
+    # Generate store-item actions + rollups
+    store_item_actions = generate_store_item_actions(fact_kpi, kpi_rules, action_map)
+    if not store_item_actions.empty:
+        outputs["store_item_actions"] = store_item_actions
+        outputs["action_rollup_brand"] = generate_action_rollup(store_item_actions, ["brand"])
+        outputs["action_rollup_region"] = generate_action_rollup(store_item_actions, ["region"])
+        outputs["action_rollup_store_tier"] = generate_action_rollup(store_item_actions, ["store_tier"])
+
+        # Exec insights
+        outputs["commercial_insights"] = generate_commercial_insights(outputs, outputs["action_rollup_brand"], kpi_rules)
+
+    # Export
+    export_all_formats(outputs, export_parquet=bool(cfg.get("export_parquet", False)))
+
+    print("\n" + "=" * 60)
+    print("  PIPELINE COMPLETE")
+    print("=" * 60 + "\n")
+
+    return outputs
+
+########################
+# CLI                  #
+########################
 
 if __name__ == "__main__":
-    launch_gradio()
+    import sys
+
+    config_file = "kpi_config.json"
+    if len(sys.argv) > 1:
+        config_file = sys.argv[1]
+
+    cfg = load_config(config_file)
+
+    required = [
+        "file_dim_item",
+        "file_dim_store",
+        "file_f_store_item_ly",
+        "file_f_store_item_current",
+        "file_f_store_subcategory_season",
+        "file_f_active_store_item",
+    ]
+    missing = [f for f in required if not cfg.get(f)]
+    if missing:
+        print(f"ERROR: Missing required files in config: {missing}")
+        print("\nCreate config with:")
+        print(json.dumps(DEFAULT_CONFIG, indent=2))
+        sys.exit(1)
+
+    outputs = run_kpi_pipeline(cfg)
+
+    print("\nAvailable output tables:")
+    for name, df in outputs.items():
+        print(f"  - {name}: {len(df):,} rows")
