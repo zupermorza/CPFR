@@ -34,6 +34,17 @@ DEFAULT_CONFIG = {
     "file_valid_item_trait": "",
     "lead_time_wks": 2,
     "buffer_wks": 0.5,
+    "uplift_enabled": True,
+    "uplift_cap_min": 0.70,
+    "uplift_cap_max": 1.50,
+    "uplift_method": "cap_ratio_to_median",
+    "uplift_benchmark": "trait_median",
+    "dup_policy_current": "sum",
+    "dup_policy_n4w": "sum",
+    "dup_warn_threshold": 0.02,
+    "need_cap_z": 3.0,
+    "need_cap_abs_units": 1000,
+    "history_block_weeks": 4,
     "hhi_threshold": 0.25,
     "share_excess_pp": 20.0,
     "efficiency_base_units": 100.0
@@ -144,9 +155,153 @@ def dedup_sum(df: pd.DataFrame, keys: List[str], sum_cols: List[str], max_cols: 
                 agg_dict[c] = "max"
     return df.groupby(keys, dropna=False, as_index=False, observed=True).agg(agg_dict)
 
+def aggregate_duplicates(df: pd.DataFrame, keys: List[str], policy: str = "sum",
+                         numeric_cols: Optional[List[str]] = None) -> Tuple[pd.DataFrame, Dict]:
+    if df.empty:
+        diagnostics = {
+            "dup_rate": 0.0,
+            "duplicated_keys": 0,
+            "total_rows": 0,
+            "top_keys": pd.DataFrame(columns=keys + ["row_count"])
+        }
+        return df.copy(), diagnostics
+
+    key_counts = df.groupby(keys, dropna=False, observed=True).size().rename("row_count")
+    duplicated_keys = int((key_counts > 1).sum())
+    total_rows = len(df)
+    dup_rate = duplicated_keys / total_rows if total_rows else 0.0
+    top_keys = key_counts.sort_values(ascending=False).head(10).reset_index()
+
+    if numeric_cols is None:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c in df.columns]
+
+    if policy == "max":
+        agg_dict = {c: "max" for c in numeric_cols}
+        aggregated = df.groupby(keys, dropna=False, as_index=False, observed=True).agg(agg_dict)
+    elif policy == "first":
+        aggregated = df.sort_index().drop_duplicates(subset=keys, keep="first")
+    else:
+        agg_dict = {c: "sum" for c in numeric_cols}
+        aggregated = df.groupby(keys, dropna=False, as_index=False, observed=True).agg(agg_dict)
+
+    diagnostics = {
+        "dup_rate": dup_rate,
+        "duplicated_keys": duplicated_keys,
+        "total_rows": total_rows,
+        "top_keys": top_keys
+    }
+    return aggregated, diagnostics
+
 def safe_merge(left: pd.DataFrame, right: pd.DataFrame, on: List[str], how: str = "left") -> pd.DataFrame:
     right_dedup = right.drop_duplicates(on)
     return pd.merge(left, right_dedup, on=on, how=how)
+
+def compute_uplift_factor(store_sub_share_norm: pd.Series, benchmark_share_norm: pd.Series,
+                          uplift_enabled: bool = True,
+                          uplift_method: str = "cap_ratio_to_median",
+                          uplift_cap_min: float = 0.70,
+                          uplift_cap_max: float = 1.50) -> pd.DataFrame:
+    valid = (store_sub_share_norm.notna() & benchmark_share_norm.notna() &
+             (store_sub_share_norm > 0) & (benchmark_share_norm > 0))
+    uplift_factor_raw = pd.Series(np.where(valid, store_sub_share_norm / benchmark_share_norm, 1.0),
+                                  index=store_sub_share_norm.index)
+
+    if not uplift_enabled or uplift_method == "none":
+        uplift_factor_applied = pd.Series(1.0, index=store_sub_share_norm.index)
+    elif uplift_method == "log_shrink":
+        log_raw = np.log(uplift_factor_raw.clip(lower=1e-6))
+        log_min = np.log(uplift_cap_min)
+        log_max = np.log(uplift_cap_max)
+        uplift_factor_applied = np.exp(log_raw.clip(lower=log_min, upper=log_max))
+    else:
+        uplift_factor_applied = uplift_factor_raw.clip(lower=uplift_cap_min, upper=uplift_cap_max)
+
+    uplift_factor_applied = np.where(valid, uplift_factor_applied, 1.0)
+    uplift_capped_flag = valid & ((uplift_factor_raw < uplift_cap_min) | (uplift_factor_raw > uplift_cap_max))
+
+    return pd.DataFrame({
+        "uplift_factor_raw": uplift_factor_raw,
+        "uplift_factor_applied": uplift_factor_applied,
+        "uplift_capped_flag": uplift_capped_flag
+    })
+
+def compute_inventory_aggregation(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+    if "store_id" not in df.columns or "item_id" not in df.columns:
+        diag = {
+            "dup_rate": 0.0,
+            "num_aggregated_rows": 0,
+            "top_offenders": pd.DataFrame(columns=["store_id", "item_id", "dup_count", "on_hand_agg"])
+        }
+        df = df.copy()
+        df["on_hand_agg"] = df["on_hand"] if "on_hand" in df.columns else 0
+        df["inventory_aggregated_flag"] = False
+        return df, diag
+
+    key_counts = df.groupby(["store_id", "item_id"], dropna=False, observed=True).size().rename("dup_count")
+    total_unique = len(key_counts)
+    duplicated_keys = int((key_counts > 1).sum())
+    dup_rate = duplicated_keys / total_unique if total_unique else 0.0
+
+    agg_on_hand = df.groupby(["store_id", "item_id"], dropna=False, observed=True)["on_hand"].sum().rename("on_hand_agg")
+    agg = pd.concat([key_counts, agg_on_hand], axis=1).reset_index()
+    top_offenders = agg.sort_values("dup_count", ascending=False).head(50)
+
+    df = safe_merge(df, agg[["store_id", "item_id", "on_hand_agg", "dup_count"]],
+                    on=["store_id", "item_id"], how="left")
+    df["inventory_aggregated_flag"] = df["dup_count"].fillna(0) > 1
+    df = df.drop(columns=["dup_count"])
+
+    diag = {
+        "dup_rate": dup_rate,
+        "num_aggregated_rows": int(df["inventory_aggregated_flag"].sum()),
+        "top_offenders": top_offenders
+    }
+    return df, diag
+
+def compute_statistical_need_cap(history_per_week: pd.Series,
+                                 total_horizon_wks: float,
+                                 z_value: float = 3.0,
+                                 abs_cap: int = 1000) -> float:
+    history_clean = history_per_week.dropna()
+    if history_clean.empty:
+        return float(abs_cap)
+    if len(history_clean) < 2:
+        median_val = float(history_clean.median())
+        cap_per_week = median_val * 2
+    else:
+        median_val = float(history_clean.median())
+        iqr_val = float(history_clean.quantile(0.75) - history_clean.quantile(0.25))
+        cap_per_week = median_val + z_value * iqr_val
+
+    cap_units = np.ceil(cap_per_week * total_horizon_wks)
+    return float(min(abs_cap, cap_units))
+
+def compute_additional_needed_units(demand_horizon_units: pd.Series,
+                                    inventory_position: pd.Series,
+                                    history_totals: pd.DataFrame,
+                                    history_block_weeks: int,
+                                    total_horizon_wks: float,
+                                    z_value: float = 3.0,
+                                    abs_cap: int = 1000) -> pd.DataFrame:
+    raw_need = np.ceil(np.maximum(0, demand_horizon_units - inventory_position))
+    if history_totals.empty:
+        cap_units = pd.Series(abs_cap, index=demand_horizon_units.index)
+    else:
+        per_week_hist = history_totals.div(history_block_weeks)
+        cap_units = per_week_hist.apply(
+            lambda row: compute_statistical_need_cap(row, total_horizon_wks, z_value=z_value, abs_cap=abs_cap),
+            axis=1
+        )
+    capped_need = np.minimum(raw_need, cap_units)
+    need_capped_flag = raw_need > cap_units
+
+    return pd.DataFrame({
+        "additional_needed_raw": raw_need.astype("Int64"),
+        "additional_needed_units": capped_need.astype("Int64"),
+        "need_cap_units": cap_units,
+        "need_capped_flag": need_capped_flag
+    })
 
 def format_percentages(df: pd.DataFrame) -> pd.DataFrame:
     """Convert decimal percentages to percentage format with 1 decimal"""
@@ -190,9 +345,8 @@ def read_current_cached(file: str) -> pd.DataFrame:
     df = df.rename(columns=rename_map)
     drop_cols = [c for c in df.columns if c.strip().lower() == "item flags"]
     if drop_cols: df = df.drop(columns=drop_cols)
-    df = clip_nonneg(df, ["on_hand","sales_last4"])
+    df = clip_nonneg(df, ["on_hand","sales_last4","on_order","in_transit","reserved","allocated"])
     df = normalize_keys(df)
-    df = dedup_sum(df, keys=["store_id","client_item_nbr"], sum_cols=["on_hand","sales_last4"])
     df = optimize_dtypes(df)
     return df
 
@@ -222,7 +376,6 @@ def read_next4_cached(file: str) -> pd.DataFrame:
     df = df.rename(columns=rename_map)
     df = clip_nonneg(df, ["n4w"])
     df = normalize_keys(df)
-    df = dedup_sum(df, keys=["store_id","client_item_nbr"], sum_cols=["n4w"])
     df = optimize_dtypes(df)
     return df
 
@@ -501,7 +654,12 @@ def compute_compliance_by_levels(df_current: pd.DataFrame) -> Dict[str, pd.DataF
     return results
 
 def compute_forecast(df_current_enriched: pd.DataFrame, df_next4: pd.DataFrame,
-                     df_store_subcat: pd.DataFrame) -> pd.DataFrame:
+                     df_store_subcat: pd.DataFrame,
+                     uplift_enabled: bool = True,
+                     uplift_cap_min: float = 0.70,
+                     uplift_cap_max: float = 1.50,
+                     uplift_method: str = "cap_ratio_to_median",
+                     uplift_benchmark: str = "trait_median") -> pd.DataFrame:
     """Compute forecast (store-item level for uplift calculation)"""
     base = safe_merge(df_current_enriched, df_next4, on=["store_id","client_item_nbr"], how="left")
     wk_lvl = base["sales_last4"].fillna(0) / 4.0
@@ -509,7 +667,7 @@ def compute_forecast(df_current_enriched: pd.DataFrame, df_next4: pd.DataFrame,
     blended_4w = np.where(pd.isna(baseline_4w), wk_lvl * 4.0, 0.6 * baseline_4w + 0.4 * (wk_lvl * 4.0))
     base["fc_final"] = pd.Series(blended_4w).clip(lower=0)
 
-    # Apply uplift
+    # Apply uplift with guardrails at store-subcategory level
     if not df_store_subcat.empty and ("subcategory" in base.columns):
         sub = df_store_subcat.copy()
         sub_chain = sub.groupby("subcategory", dropna=False, observed=True)["units"].sum().reset_index(name="sub_units_chain")
@@ -519,14 +677,72 @@ def compute_forecast(df_current_enriched: pd.DataFrame, df_next4: pd.DataFrame,
         sub_share["sum_share_subcat"] = sub_share.groupby("subcategory", observed=True)["store_sub_share"].transform("sum")
         sub_share["store_sub_share_norm"] = np.where(sub_share["sum_share_subcat"]>0, sub_share["store_sub_share"]/sub_share["sum_share_subcat"], sub_share["store_sub_share"])
         base = safe_merge(base, sub_share[["store_id","subcategory","store_sub_share_norm"]], on=["store_id","subcategory"], how="left")
-        med = sub_share.groupby("subcategory", observed=True)["store_sub_share_norm"].median().rename("median_sub_share_norm").reset_index()
-        base = safe_merge(base, med, on=["subcategory"], how="left")
-        base["uplift_factor"] = np.where(base["median_sub_share_norm"]>0, base["store_sub_share_norm"]/base["median_sub_share_norm"], 1.0)
+        med_global = sub_share.groupby("subcategory", observed=True)["store_sub_share_norm"].median().rename("median_sub_share_norm").reset_index()
+        base = safe_merge(base, med_global, on=["subcategory"], how="left")
+
         if "store_trait" in base.columns:
-            base["uplift_factor"] = np.where((base["store_trait"].isin(list(SMALL_TRAITS))) | (base["store_sub_share_norm"].isna()), 1.0, base["uplift_factor"])
+            store_trait_map = base[["store_id","store_trait"]].drop_duplicates()
+            sub_share = safe_merge(sub_share, store_trait_map, on=["store_id"], how="left")
+            med_trait = sub_share.groupby(["subcategory","store_trait"], observed=True)["store_sub_share_norm"] \
+                .median().rename("median_trait_sub_share_norm").reset_index()
+            base = safe_merge(base, med_trait, on=["subcategory","store_trait"], how="left")
+            if uplift_benchmark == "trait_median":
+                base["benchmark_sub_share_norm"] = base["median_trait_sub_share_norm"].fillna(base["median_sub_share_norm"])
+            else:
+                base["benchmark_sub_share_norm"] = base["median_sub_share_norm"]
         else:
-            base["uplift_factor"] = np.where((base["store_sub_share_norm"].isna()), 1.0, base["uplift_factor"])
-        base["fc_final"] = (base["fc_final"] * base["uplift_factor"]).fillna(base["fc_final"])
+            base["benchmark_sub_share_norm"] = base["median_sub_share_norm"]
+
+        uplift_df = compute_uplift_factor(
+            base["store_sub_share_norm"],
+            base["benchmark_sub_share_norm"],
+            uplift_enabled=uplift_enabled,
+            uplift_method=uplift_method,
+            uplift_cap_min=uplift_cap_min,
+            uplift_cap_max=uplift_cap_max
+        )
+
+        if "store_trait" in base.columns:
+            small_trait_mask = base["store_trait"].isin(list(SMALL_TRAITS))
+            uplift_df.loc[small_trait_mask, ["uplift_factor_raw", "uplift_factor_applied"]] = 1.0
+            uplift_df.loc[small_trait_mask, "uplift_capped_flag"] = False
+
+        base["uplift_raw_store_subcat"] = uplift_df["uplift_factor_raw"]
+        base["uplift_applied_store_subcat"] = uplift_df["uplift_factor_applied"]
+        base["uplift_capped_flag"] = uplift_df["uplift_capped_flag"]
+
+        base["fc_baseline"] = base["fc_final"]
+        subcat_keys = ["store_id", "subcategory"]
+        base["subcat_fc_total"] = base.groupby(subcat_keys, dropna=False, observed=True)["fc_baseline"].transform("sum")
+        base["subcat_fc_uplifted"] = base["subcat_fc_total"] * base["uplift_applied_store_subcat"]
+        base["uplift_delta"] = base["subcat_fc_uplifted"] - base["subcat_fc_total"]
+
+        baseline_share = np.where(base["subcat_fc_total"] > 0,
+                                  base["fc_baseline"] / base["subcat_fc_total"],
+                                  np.nan)
+        sales_share = np.where(
+            base.groupby(subcat_keys, dropna=False, observed=True)["sales_last4"].transform("sum") > 0,
+            base["sales_last4"] / base.groupby(subcat_keys, dropna=False, observed=True)["sales_last4"].transform("sum"),
+            np.nan
+        )
+        sku_count = base.groupby(subcat_keys, dropna=False, observed=True)["client_item_nbr"].transform("count")
+        equal_share = np.where(sku_count > 0, 1.0 / sku_count, 0)
+
+        share = pd.Series(baseline_share, index=base.index)
+        share = share.fillna(pd.Series(sales_share, index=base.index))
+        share = share.fillna(pd.Series(equal_share, index=base.index))
+        share_sum = share.groupby([base["store_id"], base["subcategory"]]).transform("sum")
+        share = np.where(share_sum > 0, share / share_sum, 0)
+
+        base["fc_final_post_uplift"] = base["fc_baseline"] + (base["uplift_delta"] * share)
+        base["fc_final_post_uplift"] = base["fc_final_post_uplift"].clip(lower=0)
+        base["fc_final"] = base["fc_final_post_uplift"]
+        base = base.drop(columns=["fc_baseline", "subcat_fc_total", "subcat_fc_uplifted", "uplift_delta"])
+    else:
+        base["uplift_raw_store_subcat"] = 1.0
+        base["uplift_applied_store_subcat"] = 1.0
+        base["uplift_capped_flag"] = False
+        base["fc_final_post_uplift"] = base["fc_final"]
 
     return base
 
@@ -549,7 +765,8 @@ def compute_forecast_by_levels(df_fc: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     
     return results
 
-def compute_risk_by_levels(df_fc: pd.DataFrame, lead_time_wks: int = 2, buffer_wks: float = 0.5) -> Dict[str, pd.DataFrame]:
+def compute_risk_by_levels(df_fc: pd.DataFrame, lead_time_wks: float = 2, buffer_wks: float = 0.5,
+                           total_horizon_wks: Optional[float] = None) -> Dict[str, pd.DataFrame]:
     """Compute stockout risk separately for each hierarchy level"""
     results = {}
     
@@ -558,7 +775,8 @@ def compute_risk_by_levels(df_fc: pd.DataFrame, lead_time_wks: int = 2, buffer_w
     
     df = df_fc.copy()
     df["wk_demand"] = df["fc_final"] / 4.0
-    demand_horizon = (lead_time_wks + buffer_wks) * df["wk_demand"]
+    horizon_wks = total_horizon_wks if total_horizon_wks is not None else (lead_time_wks + buffer_wks)
+    demand_horizon = horizon_wks * df["wk_demand"]
     df["demand_horizon"] = demand_horizon
     df["risk_gap"] = df["demand_horizon"] - df["on_hand"]
     df["stockout_risk_flag"] = (df["risk_gap"] > 0).astype(np.int8)
@@ -700,6 +918,9 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
     
     if filters is None:
         filters = {}
+
+    warnings_list = []
+    report = {}
     
     required = ["file_current","file_wk5","file_next4","file_item_lookup","file_store_lookup"]
     for k in required:
@@ -710,9 +931,9 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
     print("Step 1/5: Loading data files...")
     
     # Use cached readers
-    df_current = read_current_cached(cfg["file_current"])
+    df_current_raw = read_current_cached(cfg["file_current"])
     df_wk5 = read_wk5_cached(cfg["file_wk5"])
-    df_next4 = read_next4_cached(cfg["file_next4"])
+    df_next4_raw = read_next4_cached(cfg["file_next4"])
     
     df_store_subcat = pd.DataFrame()
     if cfg.get("file_store_subcat") and os.path.exists(cfg["file_store_subcat"]):
@@ -720,6 +941,38 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
     
     item_lookup = read_item_lookup_cached(cfg["file_item_lookup"])
     store_lookup = read_store_lookup_cached(cfg["file_store_lookup"])
+
+    dup_policy_current = cfg.get("dup_policy_current", "sum")
+    dup_policy_n4w = cfg.get("dup_policy_n4w", "sum")
+    dup_warn_threshold = float(cfg.get("dup_warn_threshold", 0.02))
+
+    current_numeric_cols = ["on_hand", "sales_last4"]
+    df_current, dup_diag_current = aggregate_duplicates(
+        df_current_raw,
+        keys=["store_id", "client_item_nbr"],
+        policy=dup_policy_current,
+        numeric_cols=current_numeric_cols
+    )
+    df_next4, dup_diag_n4w = aggregate_duplicates(
+        df_next4_raw,
+        keys=["store_id", "client_item_nbr"],
+        policy=dup_policy_n4w,
+        numeric_cols=["n4w"]
+    )
+
+    if dup_diag_current["dup_rate"] > dup_warn_threshold:
+        warnings_list.append(
+            f"Current inventory duplicates detected: {dup_diag_current['dup_rate']:.1%} of keys duplicated."
+        )
+    if dup_diag_n4w["dup_rate"] > dup_warn_threshold:
+        warnings_list.append(
+            f"N4W sell-out duplicates detected: {dup_diag_n4w['dup_rate']:.1%} of keys duplicated."
+        )
+
+    report["duplicate_diagnostics"] = {
+        "current": dup_diag_current,
+        "n4w": dup_diag_n4w
+    }
     
     print(f"  Loaded {len(df_current):,} current inventory records")
     print(f"  Loaded {len(item_lookup):,} items and {len(store_lookup):,} stores")
@@ -768,8 +1021,27 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
         after = len(cur_enriched)
         print(f"  Filtered to {after:,} records ({100*after/before:.1f}% of previous)")
 
+    cur_enriched, inventory_diag = compute_inventory_aggregation(cur_enriched)
+
+    inventory_dup_rate = inventory_diag["dup_rate"]
+    inventory_dup_path = ""
+    if inventory_dup_rate > 0.02:
+        warnings_list.append(
+            f"Inventory duplicates by item_id detected: {inventory_dup_rate:.1%} of store-item_id keys duplicated."
+        )
+        inv_path = os.path.join(EXPORT_DIR, "top_inventory_duplicates.csv")
+        inventory_diag["top_offenders"].to_csv(inv_path, index=False, encoding="utf-8-sig")
+        inventory_dup_path = inv_path
+
+    report["inventory_duplicates"] = inventory_diag
+
     # Store dataframes for filter options
-    dataframes = {"cur_enriched": cur_enriched}
+    dataframes = {
+        "cur_enriched": cur_enriched,
+        "dup_current_top": dup_diag_current["top_keys"],
+        "dup_n4w_top": dup_diag_n4w["top_keys"],
+        "dup_inventory_top": inventory_diag["top_offenders"]
+    }
 
     print("\nStep 3/5: Computing KPIs by hierarchy levels...")
     
@@ -786,17 +1058,73 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
 
     # Forecast & Risk
     print("  - Forecast with uplift")
-    df_fc = compute_forecast(cur_enriched, df_next4, df_store_subcat)
-    
-    lead_time_wks = int(cfg.get("lead_time_wks", 2))
+    df_fc = compute_forecast(
+        cur_enriched,
+        df_next4,
+        df_store_subcat,
+        uplift_enabled=bool(cfg.get("uplift_enabled", True)),
+        uplift_cap_min=float(cfg.get("uplift_cap_min", 0.70)),
+        uplift_cap_max=float(cfg.get("uplift_cap_max", 1.50)),
+        uplift_method=cfg.get("uplift_method", "cap_ratio_to_median"),
+        uplift_benchmark=cfg.get("uplift_benchmark", "trait_median")
+    )
+
+    lead_time_wks = float(cfg.get("lead_time_wks", 2))
     buffer_wks = float(cfg.get("buffer_wks", 0.5))
+    total_horizon_wks = lead_time_wks + buffer_wks
 
     # Calculate purchase proposal fields at store-item level
     df_fc["wk_demand"] = (df_fc["fc_final"] / 4.0).clip(lower=0)
-    df_fc["demand_horizon_units"] = (df_fc["wk_demand"] * (lead_time_wks + buffer_wks)).clip(lower=0)
-    df_fc["additional_needed_units"] = np.ceil(
-        np.maximum(0, df_fc["demand_horizon_units"] - df_fc["on_hand"])
-    ).astype("Int64")
+    df_fc["total_horizon_wks"] = total_horizon_wks
+    df_fc["demand_horizon_units"] = (df_fc["wk_demand"] * total_horizon_wks).clip(lower=0)
+
+    df_fc["inventory_position"] = df_fc["on_hand_agg"]
+
+    history_block_weeks = int(cfg.get("history_block_weeks", 4))
+    history_sources = ["sales_last4"]
+    optional_history_cols = [c for c in ["n4w_last_year", "ly_n4w"] if c in df_fc.columns]
+    history_sources.extend(optional_history_cols)
+    history_totals = df_fc[history_sources].copy() if history_sources else pd.DataFrame(index=df_fc.index)
+
+    need_df = compute_additional_needed_units(
+        df_fc["demand_horizon_units"],
+        df_fc["inventory_position"],
+        history_totals,
+        history_block_weeks=history_block_weeks,
+        total_horizon_wks=total_horizon_wks,
+        z_value=float(cfg.get("need_cap_z", 3.0)),
+        abs_cap=int(cfg.get("need_cap_abs_units", 1000))
+    )
+    df_fc["additional_needed_raw"] = need_df["additional_needed_raw"]
+    df_fc["additional_needed_units"] = need_df["additional_needed_units"]
+    df_fc["need_cap_units"] = need_df["need_cap_units"]
+    df_fc["need_capped_flag"] = need_df["need_capped_flag"]
+
+    if df_fc["need_capped_flag"].any():
+        warnings_list.append("Need cap applied to one or more rows (see store-item detail).")
+
+    if df_fc.get("uplift_capped_flag", pd.Series(False, index=df_fc.index)).any():
+        warnings_list.append("Uplift cap applied to one or more rows (see guardrails summary).")
+
+    uplift_capped_pct = float(df_fc.get("uplift_capped_flag", pd.Series(False, index=df_fc.index)).mean()) * 100
+    max_raw_uplift = float(df_fc.get("uplift_raw_store_subcat", pd.Series([1.0])).max())
+    max_applied_uplift = float(df_fc.get("uplift_applied_store_subcat", pd.Series([1.0])).max())
+    num_need_capped_rows = int(df_fc["need_capped_flag"].sum())
+
+    guardrails_summary = (
+        "**Guardrails Summary**\n"
+        f"- % rows capped (uplift): {uplift_capped_pct:.1f}%\n"
+        f"- Max raw uplift: {max_raw_uplift:.2f}\n"
+        f"- Max applied uplift: {max_applied_uplift:.2f}\n"
+        f"- Total horizon (weeks): {total_horizon_wks:.2f}\n"
+        f"- dup_rate_current_inventory: {inventory_dup_rate:.1%}\n"
+        f"- num_inventory_aggregated_rows: {inventory_diag['num_aggregated_rows']}\n"
+        f"- num_need_capped_rows: {num_need_capped_rows}\n"
+        f"- top_inventory_duplicates_path: {inventory_dup_path or 'n/a'}"
+    )
+
+    report["guardrails_summary"] = guardrails_summary
+    report["warnings"] = warnings_list
     
     print("  - Forecast aggregation (by hierarchy levels)")
     forecast_by_levels = compute_forecast_by_levels(df_fc)
@@ -806,9 +1134,12 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
     kpi_by_levels = compute_inventory_kpis_by_levels(df_fc, HIERARCHY_LEVELS, efficiency_base=float(cfg.get('efficiency_base_units', 100.0)))
     
     print("  - Stockout risk analysis (by hierarchy levels)")
-    risk_by_levels = compute_risk_by_levels(df_fc, 
-                                  lead_time_wks=int(cfg.get("lead_time_wks",2)), 
-                                  buffer_wks=float(cfg.get("buffer_wks",0.5)))
+    risk_by_levels = compute_risk_by_levels(
+        df_fc,
+        lead_time_wks=lead_time_wks,
+        buffer_wks=buffer_wks,
+        total_horizon_wks=total_horizon_wks
+    )
 
     # Distribution
     print("  - Distribution concentration (by hierarchy levels)")
@@ -862,6 +1193,9 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
             path = os.path.join(EXPORT_DIR, fname)
             df.to_csv(path, index=False, encoding="utf-8-sig")
             paths.append(path)
+
+    if inventory_dup_path:
+        paths.append(inventory_dup_path)
     
     print(f"    ✓ Exported {len(paths)} CSV files")
     
@@ -871,18 +1205,30 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
         
         detail_cols = [
             "store_id","client_item_nbr","item_id","brand","level_0","store_name",
-            "state","store_trait","on_hand","sales_last4"
+            "state","store_trait","on_hand","on_hand_agg","inventory_aggregated_flag","sales_last4"
         ]
         available_cols = [c for c in detail_cols if c in cur_enriched.columns]
         store_item_detail = cur_enriched[available_cols].copy()
 
         # Bring in forecast & proposal fields at store-item level
-        proposal_cols = ["store_id","client_item_nbr","fc_final","demand_horizon_units","additional_needed_units"]
+        proposal_cols = [
+            "store_id","client_item_nbr","fc_final","fc_final_post_uplift","demand_horizon_units",
+            "additional_needed_raw","additional_needed_units",
+            "uplift_raw_store_subcat","uplift_applied_store_subcat","uplift_capped_flag",
+            "total_horizon_wks","inventory_position",
+            "need_cap_units","need_capped_flag"
+        ]
         proposal_cols = [c for c in proposal_cols if c in df_fc.columns]
         store_item_detail = safe_merge(store_item_detail, df_fc[proposal_cols], on=["store_id","client_item_nbr"], how="left")
 
         # Optional: order columns nicely
-        desired_order = available_cols + ["fc_final","demand_horizon_units","additional_needed_units"]
+        desired_order = available_cols + [
+            "fc_final","fc_final_post_uplift","demand_horizon_units",
+            "additional_needed_raw","additional_needed_units",
+            "uplift_raw_store_subcat","uplift_applied_store_subcat","uplift_capped_flag",
+            "total_horizon_wks","inventory_position",
+            "need_cap_units","need_capped_flag"
+        ]
         store_item_detail = store_item_detail[[c for c in desired_order if c in store_item_detail.columns]]
 
         detail_path = os.path.join(EXPORT_DIR, "store_item_detail.csv")
@@ -895,7 +1241,7 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
     figs = {}
     print(f"  ✓ Created {len(figs)} analytical charts")
     
-    return outputs, paths, figs, dataframes
+    return outputs, paths, figs, dataframes, report
 
 ############################
 # Gradio UI                #
@@ -951,12 +1297,52 @@ def launch_gradio():
         with gr.Row():
             eff_base_p = gr.Slider(10.0, 1000.0, value=cfg.get("efficiency_base_units",100.0), step=10.0, label="Efficiency base (units)", info="Units for efficiency calculation (eff_per_base)")
 
+        with gr.Accordion("🛡️ Guardrails", open=False):
+            gr.Markdown("**Uplift Guardrails**")
+            with gr.Row():
+                uplift_enabled_p = gr.Checkbox(value=cfg.get("uplift_enabled", True), label="Enable uplift")
+                uplift_method_p = gr.Dropdown(
+                    choices=["cap_ratio_to_median", "log_shrink", "none"],
+                    value=cfg.get("uplift_method", "cap_ratio_to_median"),
+                    label="Uplift method"
+                )
+                uplift_benchmark_p = gr.Dropdown(
+                    choices=["trait_median", "global_median"],
+                    value=cfg.get("uplift_benchmark", "trait_median"),
+                    label="Uplift benchmark"
+                )
+            with gr.Row():
+                uplift_cap_min_p = gr.Number(value=cfg.get("uplift_cap_min", 0.70), label="Uplift cap min")
+                uplift_cap_max_p = gr.Number(value=cfg.get("uplift_cap_max", 1.50), label="Uplift cap max")
+
+            gr.Markdown("**Duplicate Handling**")
+            with gr.Row():
+                dup_policy_current_p = gr.Dropdown(
+                    choices=["sum", "max", "first"],
+                    value=cfg.get("dup_policy_current", "sum"),
+                    label="Current file duplicate policy"
+                )
+                dup_policy_n4w_p = gr.Dropdown(
+                    choices=["sum", "max", "first"],
+                    value=cfg.get("dup_policy_n4w", "sum"),
+                    label="N4W file duplicate policy"
+                )
+                dup_warn_threshold_p = gr.Number(value=cfg.get("dup_warn_threshold", 0.02), label="Duplicate warning threshold")
+
+            gr.Markdown("**Need Caps (statistical)**")
+            with gr.Row():
+                history_block_weeks_p = gr.Dropdown(choices=[4, 6, 8], value=cfg.get("history_block_weeks", 4), label="History block (weeks)")
+                need_cap_z_p = gr.Number(value=cfg.get("need_cap_z", 3.0), label="Need cap Z (median + z·IQR)")
+                need_cap_abs_p = gr.Number(value=cfg.get("need_cap_abs_units", 1000), label="Need cap (absolute units)")
+
         # Action buttons
         with gr.Row():
             save_btn = gr.Button("💾 Save Config", variant="secondary")
             run_btn = gr.Button("🚀 Run Analysis", variant="primary", size="lg")
         
         save_status = gr.Textbox(label="Config Save Status", value="")
+
+        warnings_md = gr.Markdown("")
 
         # Results tabs - ORGANIZED BY HIERARCHY LEVEL
         with gr.Tab("📊 In-Stock Analysis"):
@@ -1049,18 +1435,35 @@ def launch_gradio():
             p3 = gr.Plot(label="Risk Scores, Coverage Ratios, At-Risk Sites")
             gr.Markdown("**Chart 4: Distribution & Concentration**")
             p4 = gr.Plot(label="HHI Concentration, Over-Concentration Analysis")
+
+        with gr.Tab("🛡️ Guardrails & Diagnostics"):
+            guardrails_summary_md = gr.Markdown("Guardrails summary will appear here after analysis.")
+            with gr.Row():
+                dup_current_df = gr.Dataframe(label="Top duplicate keys - Current Inventory", wrap=True)
+                dup_n4w_df = gr.Dataframe(label="Top duplicate keys - N4W Sell-Out", wrap=True)
         
         with gr.Tab("📥 Downloads"):
             files = gr.Files(label="CSV Outputs")
             gr.Markdown("*All files contain hierarchy-level aggregated data*")
 
         # Save config function
-        def save_cfg(file_current, file_wk5, file_next4, file_store_subcat, file_item_lookup, file_store_lookup, file_valid_item_trait, lead, buffer, hhi_thr, share_pp, eff_base):
+        def save_cfg(file_current, file_wk5, file_next4, file_store_subcat, file_item_lookup, file_store_lookup,
+                     file_valid_item_trait, lead, buffer, hhi_thr, share_pp, eff_base, uplift_enabled,
+                     uplift_method, uplift_benchmark, uplift_cap_min, uplift_cap_max,
+                     dup_policy_current, dup_policy_n4w, dup_warn_threshold,
+                     history_block_weeks, need_cap_z, need_cap_abs):
             cfg_upd = {
                 "file_current": file_current, "file_wk5": file_wk5, "file_next4": file_next4,
                 "file_store_subcat": file_store_subcat, "file_item_lookup": file_item_lookup, "file_store_lookup": file_store_lookup,
                 "file_valid_item_trait": file_valid_item_trait,
-                "lead_time_wks": lead, "buffer_wks": buffer, "hhi_threshold": hhi_thr, "share_excess_pp": share_pp,
+                "lead_time_wks": lead, "buffer_wks": buffer,
+                "uplift_enabled": uplift_enabled, "uplift_method": uplift_method,
+                "uplift_benchmark": uplift_benchmark, "uplift_cap_min": uplift_cap_min,
+                "uplift_cap_max": uplift_cap_max,
+                "dup_policy_current": dup_policy_current, "dup_policy_n4w": dup_policy_n4w,
+                "dup_warn_threshold": dup_warn_threshold,
+                "history_block_weeks": history_block_weeks, "need_cap_z": need_cap_z, "need_cap_abs_units": need_cap_abs,
+                "hhi_threshold": hhi_thr, "share_excess_pp": share_pp,
                 "efficiency_base_units": eff_base
             }
             save_config("cpfr_config.json", cfg_upd)
@@ -1078,8 +1481,12 @@ def launch_gradio():
             )
 
         # Run analysis function
-        def _run(file_current, file_wk5, file_next4, file_store_subcat, file_item_lookup, file_store_lookup, 
-                file_valid_item_trait, lead, buffer, hhi_thr, share_pp, eff_base, store_trait, state, level0, brand, item, show_detail):
+        def _run(file_current, file_wk5, file_next4, file_store_subcat, file_item_lookup, file_store_lookup,
+                file_valid_item_trait, lead, buffer, hhi_thr, share_pp, eff_base, uplift_enabled,
+                uplift_method, uplift_benchmark, uplift_cap_min, uplift_cap_max,
+                dup_policy_current, dup_policy_n4w, dup_warn_threshold,
+                history_block_weeks, need_cap_z, need_cap_abs,
+                store_trait, state, level0, brand, item, show_detail):
             
             # Prepare filters
             filters = {
@@ -1094,12 +1501,19 @@ def launch_gradio():
                 "file_current": file_current, "file_wk5": file_wk5, "file_next4": file_next4,
                 "file_store_subcat": file_store_subcat, "file_item_lookup": file_item_lookup, "file_store_lookup": file_store_lookup,
                 "file_valid_item_trait": file_valid_item_trait,
-                "lead_time_wks": lead, "buffer_wks": buffer, "hhi_threshold": hhi_thr, "share_excess_pp": share_pp,
+                "lead_time_wks": lead, "buffer_wks": buffer,
+                "uplift_enabled": uplift_enabled, "uplift_method": uplift_method,
+                "uplift_benchmark": uplift_benchmark, "uplift_cap_min": uplift_cap_min,
+                "uplift_cap_max": uplift_cap_max,
+                "dup_policy_current": dup_policy_current, "dup_policy_n4w": dup_policy_n4w,
+                "dup_warn_threshold": dup_warn_threshold,
+                "history_block_weeks": history_block_weeks, "need_cap_z": need_cap_z, "need_cap_abs_units": need_cap_abs,
+                "hhi_threshold": hhi_thr, "share_excess_pp": share_pp,
                 "efficiency_base_units": eff_base
             }
             
             try:
-                outputs, paths, figs, dataframes = run_engine_paths(cfg, filters, show_store_item=show_detail)
+                outputs, paths, figs, dataframes, report = run_engine_paths(cfg, filters, show_store_item=show_detail)
                 
                 # Update filter options
                 filter_updates = update_filters(dataframes)
@@ -1108,6 +1522,10 @@ def launch_gradio():
                 def get_df(key):
                     return outputs.get(key, pd.DataFrame())
                 
+                warnings_text = "\n".join([f"- {w}" for w in report.get("warnings", [])]) or "No warnings triggered."
+                warnings_md_value = f"**Warnings**\n{warnings_text}"
+                guardrails_summary = report.get("guardrails_summary", "Guardrails summary unavailable.")
+
                 return (
                     # In-stock
                     get_df("instock_store_trait"),
@@ -1152,6 +1570,12 @@ def launch_gradio():
                     figs[3] if len(figs) > 3 else None,
                     # Files
                     paths,
+                    # Guardrails summary + warnings
+                    guardrails_summary,
+                    warnings_md_value,
+                    # Duplicate diagnostics
+                    dataframes.get("dup_current_top", pd.DataFrame()),
+                    dataframes.get("dup_n4w_top", pd.DataFrame()),
                     # Filter updates
                     *filter_updates,
                     # Dataframes state
@@ -1162,13 +1586,16 @@ def launch_gradio():
                 error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
                 print(error_msg)
                 empty_df = pd.DataFrame()
-                return tuple([empty_df] * 28 + [None, None, None, None, []] + [gr.update()] * 5 + [{}])
+                return tuple([empty_df] * 29 + [None, None, None, None, []] + ["", "", empty_df, empty_df] + [gr.update()] * 5 + [{}])
 
         # Connect buttons
         save_btn.click(
             save_cfg,
-            inputs=[file_current_p, file_wk5_p, file_next4_p, file_store_subcat_p, file_item_lookup_p, 
-                   file_store_lookup_p, file_valid_item_trait_p, lead_p, buffer_p, hhi_thr_p, share_pp_p, eff_base_p],
+            inputs=[file_current_p, file_wk5_p, file_next4_p, file_store_subcat_p, file_item_lookup_p,
+                   file_store_lookup_p, file_valid_item_trait_p, lead_p, buffer_p, hhi_thr_p, share_pp_p, eff_base_p,
+                   uplift_enabled_p, uplift_method_p, uplift_benchmark_p, uplift_cap_min_p, uplift_cap_max_p,
+                   dup_policy_current_p, dup_policy_n4w_p, dup_warn_threshold_p,
+                   history_block_weeks_p, need_cap_z_p, need_cap_abs_p],
             outputs=[save_status]
         )
 
@@ -1176,6 +1603,9 @@ def launch_gradio():
             _run,
             inputs=[file_current_p, file_wk5_p, file_next4_p, file_store_subcat_p, file_item_lookup_p,
                    file_store_lookup_p, file_valid_item_trait_p, lead_p, buffer_p, hhi_thr_p, share_pp_p, eff_base_p,
+                   uplift_enabled_p, uplift_method_p, uplift_benchmark_p, uplift_cap_min_p, uplift_cap_max_p,
+                   dup_policy_current_p, dup_policy_n4w_p, dup_warn_threshold_p,
+                   history_block_weeks_p, need_cap_z_p, need_cap_abs_p,
                    store_trait_filter, state_filter, level0_filter, brand_filter, item_filter, show_store_item_check],
             outputs=[
                 # In-stock (5)
@@ -1196,6 +1626,8 @@ def launch_gradio():
                 p1, p2, p3, p4,
                 # Files (1)
                 files,
+                # Guardrails summary + warnings + duplicate diagnostics
+                guardrails_summary_md, warnings_md, dup_current_df, dup_n4w_df,
                 # Filters (5)
                 store_trait_filter, state_filter, level0_filter, brand_filter, item_filter,
                 # State (1)
