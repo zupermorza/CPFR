@@ -540,7 +540,7 @@ def enrich_instock_tables_with_kpis(outputs: Dict[str, pd.DataFrame], kpi_by_lev
             # Merge KPIs into existing instock table
             try:
                 # Get KPI columns only (exclude aggregated columns already in instock)
-                kpi_cols = [level_col, 'avg_wk_fc', 'avg_wk_l4w', 'doi_days', 'eff_per_base', 'coverage_wks_fc']
+                kpi_cols = [level_col, 'doi_days', 'eff_per_base']
                 available_kpi_cols = [c for c in kpi_cols if c in kpi_df.columns]
                 
                 if len(available_kpi_cols) > 1:  # More than just the key column
@@ -569,6 +569,9 @@ def compute_instock_by_levels(df_current: pd.DataFrame) -> Dict[str, pd.DataFram
     
     tmp = df_current.copy()
     tmp["in_stock_flag"] = (tmp["on_hand"] > 0).astype(np.int8)
+    tmp["avg_wk_sales"] = tmp["sales_last4"].fillna(0) / 4.0
+    tmp["weeks_of_supply"] = np.where(tmp["avg_wk_sales"] > 0, tmp["on_hand"] / tmp["avg_wk_sales"], np.nan)
+    tmp["overstock_flag"] = ((tmp["on_hand"] > 1) & (tmp["weeks_of_supply"] > 8)).astype(np.int8)
     
     # Compute for each hierarchy level independently
     for level_col, level_name in HIERARCHY_LEVELS.items():
@@ -579,16 +582,68 @@ def compute_instock_by_levels(df_current: pd.DataFrame) -> Dict[str, pd.DataFram
                 in_stock_sites=("in_stock_flag", "sum"),
                 on_hand=("on_hand", "sum"),
                 sales_last4=("sales_last4", "sum"),
+                overstock_combinations=("overstock_flag", "sum"),
             )
             
             out["instock_pct_sites"] = np.where(out["sites"]>0, out["in_stock_sites"]/out["sites"], np.nan)
-            out["instock_pct_sales_weighted"] = out["instock_pct_sites"]
+            out["overstock_pct_combinations"] = np.where(out["sites"]>0, out["overstock_combinations"]/out["sites"], np.nan)
+
+            if level_col == "store_trait":
+                total_row = pd.DataFrame([{
+                    "store_trait": "TOTAL",
+                    "sites": out["sites"].sum(),
+                    "in_stock_sites": out["in_stock_sites"].sum(),
+                    "on_hand": out["on_hand"].sum(),
+                    "sales_last4": out["sales_last4"].sum(),
+                    "overstock_combinations": out["overstock_combinations"].sum()
+                }])
+                total_row["instock_pct_sites"] = np.where(
+                    total_row["sites"] > 0,
+                    total_row["in_stock_sites"] / total_row["sites"],
+                    np.nan
+                )
+                total_row["overstock_pct_combinations"] = np.where(
+                    total_row["sites"] > 0,
+                    total_row["overstock_combinations"] / total_row["sites"],
+                    np.nan
+                )
+                out = pd.concat([total_row, out], ignore_index=True)
             
             out = format_percentages(out)
             out = round_numeric(out)
             results[level_col] = out
     
     return results
+
+def compute_overstock_detail(df_current: pd.DataFrame) -> pd.DataFrame:
+    if df_current.empty:
+        return pd.DataFrame()
+    df = df_current.copy()
+    df["avg_wk_sales"] = df["sales_last4"].fillna(0) / 4.0
+    df["weeks_of_supply"] = np.where(df["avg_wk_sales"] > 0, df["on_hand"] / df["avg_wk_sales"], np.nan)
+    df["overstock_flag"] = ((df["on_hand"] > 10) & (df["weeks_of_supply"] > 10)).astype(np.int8)
+    total_combinations = len(df)
+    overstock_pct = (100.0 * df["overstock_flag"].sum() / total_combinations) if total_combinations > 0 else 0.0
+    detail = df[df["overstock_flag"] == 1].copy()
+    detail["overstock_pct_total_combinations"] = overstock_pct
+    keep_cols = [c for c in ["store_id", "client_item_nbr", "item_id", "brand", "store_trait", "state", "on_hand", "sales_last4", "weeks_of_supply"] if c in detail.columns]
+    keep_cols.append("overstock_pct_total_combinations")
+    return round_numeric(detail[keep_cols]) if keep_cols else pd.DataFrame()
+
+def compute_inventory_split(df_current: pd.DataFrame) -> pd.DataFrame:
+    if df_current.empty:
+        return pd.DataFrame(columns=["inventory_bucket", "num_combinations"])
+    on_hand = df_current["on_hand"].fillna(0)
+    buckets = pd.Series(np.select(
+        [on_hand < 3, (on_hand >= 3) & (on_hand <= 8), on_hand > 8.0],
+        ["<3 units", "3-8 units", ">8 units"],
+        default="unknown"
+    ))
+    split = buckets.value_counts(dropna=False).rename_axis("inventory_bucket").reset_index(name="num_combinations")
+    order = {"<3 units": 0, "3-8 units": 1, ">8 units": 2, "unknown": 3}
+    split["sort_order"] = split["inventory_bucket"].map(order).fillna(99)
+    split = split.sort_values("sort_order").drop(columns=["sort_order"]).reset_index(drop=True)
+    return split
 
 def compute_slow_movers_by_levels(df_current: pd.DataFrame, df_wk5: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     """Compute slow movers separately for each hierarchy level"""
@@ -1055,6 +1110,10 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
     
     print("  - Min/Safety compliance (by hierarchy levels)")
     compliance_by_levels = compute_compliance_by_levels(cur_enriched)
+    
+    print("  - Overstock detail and inventory split")
+    overstock_detail = compute_overstock_detail(cur_enriched)
+    inventory_split = compute_inventory_split(cur_enriched)
 
     # Forecast & Risk
     print("  - Forecast with uplift")
@@ -1182,6 +1241,10 @@ def run_engine_paths(cfg: dict, filters: Dict = None, show_store_item: bool = Fa
     # Over-concentration
     for level_col, df in over_by_levels.items():
         outputs[f"over_{level_col}"] = df
+    
+    # New detail outputs
+    outputs["overstock_detail"] = overstock_detail
+    outputs["inventory_split"] = inventory_split
     
     # Export to CSV
     print("  - Exporting CSV files...")
@@ -1347,7 +1410,7 @@ def launch_gradio():
         # Results tabs - ORGANIZED BY HIERARCHY LEVEL
         with gr.Tab("📊 In-Stock Analysis"):
             gr.Markdown("**Results by each hierarchy level independently**")
-            gr.Markdown("*Includes: In-Stock %, Avg Weekly Sell-Out, DOI Days, Efficiency, Coverage*")
+            gr.Markdown("*Includes: In-Stock %, Overstock %, DOI Days, Efficiency*")
             with gr.Accordion("By Store Trait", open=True):
                 t_instock_trait = gr.Dataframe(label="In-Stock + KPIs by Store Trait", wrap=True)
             with gr.Accordion("By State", open=False):
@@ -1380,6 +1443,12 @@ def launch_gradio():
                 t_comp_level0 = gr.Dataframe(label="Compliance by Level_0", wrap=True)
             with gr.Accordion("Min/Safety Compliance - By Brand", open=False):
                 t_comp_brand = gr.Dataframe(label="Compliance by Brand", wrap=True)
+            
+            gr.Markdown("---")
+            with gr.Accordion("OverStock Detail", open=False):
+                t_overstock_detail = gr.Dataframe(label="OverStock detail (store-item)", wrap=True)
+            with gr.Accordion("Inventory Split", open=True):
+                t_inventory_split = gr.Dataframe(label="Inventory split by package buckets", wrap=True)
         
         with gr.Tab("📈 Forecast & Risk"):
             gr.Markdown("**Forecast and stockout risk by hierarchy level**")
@@ -1543,6 +1612,9 @@ def launch_gradio():
                     get_df("compliance_state"),
                     get_df("compliance_level_0"),
                     get_df("compliance_brand"),
+                    # New inventory alerts detail
+                    get_df("overstock_detail"),
+                    get_df("inventory_split"),
                     # Forecast
                     get_df("forecast_store_trait"),
                     get_df("forecast_state"),
@@ -1586,7 +1658,7 @@ def launch_gradio():
                 error_msg = f"Error: {str(e)}\n\n{traceback.format_exc()}"
                 print(error_msg)
                 empty_df = pd.DataFrame()
-                return tuple([empty_df] * 29 + [None, None, None, None, []] + ["", "", empty_df, empty_df] + [gr.update()] * 5 + [{}])
+                return tuple([empty_df] * 31 + [None, None, None, None, []] + ["", "", empty_df, empty_df] + [gr.update()] * 5 + [{}])
 
         # Connect buttons
         save_btn.click(
@@ -1614,6 +1686,8 @@ def launch_gradio():
                 t_slow_trait, t_slow_state, t_slow_level0, t_slow_brand,
                 # Compliance (4)
                 t_comp_trait, t_comp_state, t_comp_level0, t_comp_brand,
+                # Overstock + split (2)
+                t_overstock_detail, t_inventory_split,
                 # Forecast (4)
                 t_fc_trait, t_fc_state, t_fc_level0, t_fc_brand,
                 # Risk (4)
